@@ -3,6 +3,15 @@ name = "rtmp-server"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rtmp_server"
+path = "src/lib.rs"
+
+# Built as nginx.exe so it drops into an nginx folder in place of nginx.
+[[bin]]
+name = "nginx"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.1"

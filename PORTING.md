@@ -113,7 +113,7 @@ The port is a **standalone RTMP server** on `tokio`:
 Like nginx, the binary has a prefix directory: relative paths in the configuration
 (`access_log logs/access.log`) are resolved against it. It defaults to the directory
 of the executable, and the configuration to `PREFIX/conf/nginx.conf`, so dropping
-`rtmp-server.exe` into an nginx folder and running it with no arguments works.
+the binary (`nginx.exe`) into an nginx folder and running it with no arguments works.
 `-p DIR` sets the prefix, `-c FILE` the configuration. Without `-p`, when
 `PREFIX/conf/nginx.conf` doesn't exist (e.g. `cargo run`), `conf/nginx.conf` in the
 working directory is used and the working directory becomes the prefix.

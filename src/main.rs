@@ -8,7 +8,7 @@ use rtmp_server::server::Server;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: rtmp-server [-p prefix] [-c nginx.conf] [-t] [-s stop|quit]
+const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-s stop|quit]
 
   -p DIR    prefix: relative paths in the configuration (logs, pid) are
             resolved against it; default: the directory of the executable
@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
                 ("-p", Some(v)) => prefix_arg = Some(v.into()),
                 ("-s", Some(v)) if daemon::SIGNALS.contains(&v.as_str()) => signal = Some(v),
                 ("-s", Some(v)) => {
-                    eprintln!("rtmp-server: invalid option: \"-s {v}\"
+                    eprintln!("nginx: invalid option: \"-s {v}\"
 {USAGE}");
                     return ExitCode::from(2);
                 }
@@ -70,7 +70,7 @@ async fn main() -> ExitCode {
         if serve {
             tracing::error!("{msg}");
         } else {
-            eprintln!("rtmp-server: {msg}");
+            eprintln!("nginx: {msg}");
         }
         ExitCode::FAILURE
     };
@@ -104,7 +104,7 @@ async fn main() -> ExitCode {
         if let Err(e) = rtmp_server::access_log::open_all(&mut config) {
             return fail(e.to_string());
         }
-        println!("rtmp-server: configuration file {} test is successful", conf_path.display());
+        println!("nginx: configuration file {} test is successful", conf_path.display());
         return ExitCode::SUCCESS;
     }
 

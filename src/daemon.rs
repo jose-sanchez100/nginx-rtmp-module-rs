@@ -14,8 +14,8 @@ use tracing_subscriber::fmt::{self, format::Writer, time::FormatTime, MakeWriter
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{reload, EnvFilter, Registry};
 
-/// Our crate's target; the lib and the binary are both `rtmp_server`.
-const TARGET: &str = "rtmp_server";
+/// Our tracing targets: the lib (`rtmp_server`) and the binary (`nginx`).
+const TARGETS: [&str; 2] = ["rtmp_server", "nginx"];
 
 // ---------------------------------------------------------------------
 // Console
@@ -103,7 +103,7 @@ pub fn init_logging(console: bool) -> LogHandle {
         .with_filter(file_filter);
     let console = console.then(|| {
         fmt::layer().with_writer(io::stderr).with_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| format!("{TARGET}=info").into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| TARGETS.map(|t| format!("{t}=info")).join(",").into()),
         )
     });
     tracing_subscriber::registry().with(file).with(console).init();
@@ -128,7 +128,7 @@ impl LogHandle {
             "warn" => Level::WARN,
             _ => Level::ERROR,
         };
-        let _ = self.0.reload(Targets::new().with_target(TARGET, LevelFilter::from_level(level)));
+        let _ = self.0.reload(Targets::new().with_targets(TARGETS.map(|t| (t, LevelFilter::from_level(level)))));
         Ok(())
     }
 }
