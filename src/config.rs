@@ -385,7 +385,20 @@ pub struct Config {
     /// nginx's `-p` prefix. `None` resolves against the working directory
     /// and disables the implicit `logs/access.log`.
     pub prefix: Option<PathBuf>,
+    /// Top-level `error_log file [level]` (only the first one is used).
+    pub error_log: Option<ErrorLogConf>,
+    /// Top-level `pid file`.
+    pub pid: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorLogConf {
+    pub path: String,
+    /// nginx level name: debug, info, notice, warn, error, crit, alert, emerg.
+    pub level: String,
+}
+
+pub const ERROR_LOG_LEVELS: [&str; 8] = ["debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"];
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -401,6 +414,25 @@ impl Config {
             warnings: Vec::new(),
             formats: vec![("combined".to_string(), LogFormat::combined())],
         };
+        let mut error_log = None;
+        let mut pid = None;
+        for d in &tree {
+            match d.name.as_str() {
+                "error_log" if error_log.is_none() => {
+                    let (path, level) = match d.args.as_slice() {
+                        [p] => (p.clone(), "error".to_string()),
+                        [p, l, ..] => (p.clone(), l.clone()),
+                        _ => return Err(cx.err(d.line, "invalid number of arguments in \"error_log\"")),
+                    };
+                    if !ERROR_LOG_LEVELS.contains(&level.as_str()) {
+                        return Err(cx.err(d.line, format!("invalid log level \"{level}\"")));
+                    }
+                    error_log = Some(ErrorLogConf { path, level });
+                }
+                "pid" => pid = Some(cx.one(d)?.to_string()),
+                _ => {}
+            }
+        }
         let rtmp = tree
             .iter()
             .find(|d| d.name == "rtmp" && d.block.is_some())
@@ -454,7 +486,7 @@ impl Config {
         for w in cx.warnings {
             tracing::warn!("{w}");
         }
-        Ok(Config { servers, log_formats: cx.formats, prefix: None })
+        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid })
     }
 }
 
@@ -964,6 +996,23 @@ http { server { listen 8080; location / { root html; } } }
     fn syntax_error_reports_line() {
         let e = Config::parse("rtmp {\n server {\n listen 1935\n }\n}", "x").unwrap_err();
         assert!(e.to_string().contains("x:3"), "{e}");
+    }
+
+    #[test]
+    fn main_level_directives() {
+        let c = Config::parse("pid run/x.pid;
+error_log logs/e.log info;
+error_log other.log;
+rtmp { server { } }", "t").unwrap();
+        assert_eq!(c.pid.as_deref(), Some("run/x.pid"));
+        assert_eq!(c.error_log, Some(ErrorLogConf { path: "logs/e.log".into(), level: "info".into() }));
+        let c = Config::parse("error_log logs/e.log;
+rtmp { server { } }", "t").unwrap();
+        assert_eq!(c.error_log.unwrap().level, "error");
+        assert!(Config::parse("error_log e.log loud;
+rtmp { server { } }", "t").is_err());
+        let c = Config::parse("rtmp { server { } }", "t").unwrap();
+        assert!(c.pid.is_none() && c.error_log.is_none());
     }
 
     #[test]

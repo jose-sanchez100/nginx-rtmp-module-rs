@@ -70,6 +70,10 @@ The port is a **standalone RTMP server** on `tokio`:
   configurations built with `Config::parse` (tests, embedding). `log_format` is
   accepted at any level without nginx's warning. `$bytes_received` / `$bytes_sent` are
   64-bit totals after the handshake (nginx's 32-bit counter resets near 4 GB).
+- Error log: only the first top-level `error_log` is used; `notice` maps to `info` and
+  `crit`/`alert`/`emerg` to `error`. Unsupported directives are warnings, not
+  `emerg`. `-s quit` exits at once like `-s stop` (no graceful drain);
+  `-s reload` / `-s reopen` are not supported.
 
 ## Running
 
@@ -80,6 +84,14 @@ of the executable, and the configuration to `PREFIX/conf/nginx.conf`, so droppin
 `-p DIR` sets the prefix, `-c FILE` the configuration. Without `-p`, when
 `PREFIX/conf/nginx.conf` doesn't exist (e.g. `cargo run`), `conf/nginx.conf` in the
 working directory is used and the working directory becomes the prefix.
+
+Started from Explorer (double-click, or `Start-Process` with a new window), the
+process releases its console, so no window stays open; started from a terminal it
+keeps logging there (filtered by `RUST_LOG`). Errors always go to the error log:
+top-level `error_log file [level]`, default `PREFIX/logs/error.log` at level
+`error`. The PID is written to `pid` (default `PREFIX/logs/nginx.pid`) and removed
+on exit; `-s stop` / `-s quit` stops the running server (a named event on Windows,
+SIGTERM / SIGQUIT elsewhere), so an existing `stop.bat` keeps working.
 
 ## Testing
 

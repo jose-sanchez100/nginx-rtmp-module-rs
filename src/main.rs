@@ -1,38 +1,47 @@
+mod daemon;
+
+use rtmp_server::access_log::resolve_path;
 use rtmp_server::config::Config;
 use rtmp_server::server::Server;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: rtmp-server [-p prefix] [-c nginx.conf] [-t]
+const USAGE: &str = "usage: rtmp-server [-p prefix] [-c nginx.conf] [-t] [-s stop|quit]
 
-  -p DIR    prefix: relative paths in the configuration (access_log) are
+  -p DIR    prefix: relative paths in the configuration (logs, pid) are
             resolved against it; default: the directory of the executable
   -c FILE   configuration file (nginx syntax, rtmp {} block);
             default: PREFIX/conf/nginx.conf, or conf/nginx.conf in the
             working directory when -p is not given and that file is missing
   -t        test configuration and exit
+  -s SIGNAL send a signal to the running server: stop, quit
 
-Logging is controlled by RUST_LOG (e.g. RUST_LOG=rtmp_server=debug).";
+Errors go to the error log (error_log, default PREFIX/logs/error.log).
+Console output, when started from a terminal, is controlled by RUST_LOG
+(e.g. RUST_LOG=rtmp_server=debug).";
+
+const DEFAULT_ERROR_LOG: &str = "logs/error.log";
+const DEFAULT_PID: &str = "logs/nginx.pid";
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rtmp_server=info".into()),
-        )
-        .init();
-
     let mut conf_arg: Option<PathBuf> = None;
     let mut prefix_arg: Option<PathBuf> = None;
     let mut test_only = false;
+    let mut signal: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-c" | "-p" => match args.next() {
-                Some(p) if a == "-c" => conf_arg = Some(p.into()),
-                Some(p) => prefix_arg = Some(p.into()),
-                None => {
+            "-c" | "-p" | "-s" => match (a.as_str(), args.next()) {
+                ("-c", Some(v)) => conf_arg = Some(v.into()),
+                ("-p", Some(v)) => prefix_arg = Some(v.into()),
+                ("-s", Some(v)) if daemon::SIGNALS.contains(&v.as_str()) => signal = Some(v),
+                ("-s", Some(v)) => {
+                    eprintln!("rtmp-server: invalid option: \"-s {v}\"
+{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {
                     eprintln!("{USAGE}");
                     return ExitCode::from(2);
                 }
@@ -43,42 +52,83 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("unknown argument {other}\n{USAGE}");
+                eprintln!("unknown argument {other}
+{USAGE}");
                 return ExitCode::from(2);
             }
         }
     }
+    let serve = !test_only && signal.is_none();
+
+    // Started by double-click: drop the console, like nginx. Everything
+    // then goes to the error log.
+    let console = !serve || daemon::detach_console();
+    let log = daemon::init_logging(console);
+    let fail = |msg: String| {
+        if serve {
+            tracing::error!("{msg}");
+        } else {
+            eprintln!("rtmp-server: {msg}");
+        }
+        ExitCode::FAILURE
+    };
 
     let (prefix, conf_path) = locate(prefix_arg, conf_arg);
+    if serve {
+        // Until the configuration is read, use the default error log (so
+        // configuration errors are recorded somewhere).
+        if let Err(e) = log.open(&prefix.join(DEFAULT_ERROR_LOG), "error") {
+            tracing::warn!("{e}");
+        }
+    }
     let mut config = match Config::load(&conf_path) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("rtmp-server: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(e.to_string()),
     };
-    tracing::info!("configuration {}, prefix {}", conf_path.display(), prefix.display());
-    config.prefix = Some(prefix);
+    config.prefix = Some(prefix.clone());
+    let pid_path = resolve_path(Some(&prefix), config.pid.as_deref().unwrap_or(DEFAULT_PID));
+
+    if let Some(sig) = signal {
+        let pid = match daemon::read_pid(&pid_path) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
+        return match daemon::send_signal(&sig, pid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(e),
+        };
+    }
     if test_only {
         if let Err(e) = rtmp_server::access_log::open_all(&mut config) {
-            eprintln!("rtmp-server: {e}");
-            return ExitCode::FAILURE;
+            return fail(e.to_string());
         }
         println!("rtmp-server: configuration file {} test is successful", conf_path.display());
         return ExitCode::SUCCESS;
     }
 
+    if let Some(el) = &config.error_log
+        && let Err(e) = log.open(&resolve_path(Some(&prefix), &el.path), &el.level)
+    {
+        return fail(e.to_string());
+    }
+    tracing::info!("configuration {}, prefix {}", conf_path.display(), prefix.display());
     let server = match Server::bind(config).await {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("rtmp-server: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(e.to_string()),
+    };
+    if let Err(e) = daemon::write_pid(&pid_path) {
+        return fail(e.to_string());
+    }
+    let signals = match daemon::listen_signals() {
+        Ok(s) => s,
+        Err(e) => return fail(format!("signals: {e}")),
     };
     tokio::select! {
         _ = server.run() => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+        sig = signals => tracing::info!("signal {sig} received, exiting"),
     }
+    let _ = std::fs::remove_file(&pid_path);
     ExitCode::SUCCESS
 }
 
