@@ -17,6 +17,7 @@ use crate::config::{AccessAction, AccessScope, AppConf, MetaMode, RelayTarget, S
 use crate::handshake;
 use crate::live::{LiveError, Peer, Registry, SessionId, StreamRef};
 use crate::message::{self as msg, *};
+use crate::monitor::Role;
 use crate::notify::{self, Form, Reply};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
@@ -133,6 +134,8 @@ struct Session {
     notify: Option<NotifyState>,
     /// Access log values (`ngx_rtmp_log_ctx_t` + session counters).
     log: LogCtx,
+    /// Received bytes, shared with the monitor.
+    bytes_in: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -185,6 +188,9 @@ where
     let close = Arc::new(Notify::new());
     let out_bytes = Arc::new(AtomicU64::new(0));
     let writer = tokio::spawn(writer_task(wr, rx, conf.timeout, close.clone(), out_bytes.clone()).in_current_span());
+    let bytes_in = Arc::new(AtomicU64::new(0));
+    let _monitored =
+        ctx.registry.monitor.register(id, addr, ctx.index, bytes_in.clone(), out_bytes.clone(), close.clone());
 
     let mut s = Session {
         id,
@@ -210,6 +216,7 @@ where
         last_ts: Arc::new(AtomicU32::new(0)),
         notify: None,
         log: LogCtx::default(),
+        bytes_in,
     };
 
     let result = s.read_loop(&mut rd).await;
@@ -365,6 +372,7 @@ impl Session {
     fn account_in(&mut self, n: usize) -> Result<()> {
         self.in_bytes = self.in_bytes.wrapping_add(n as u32);
         self.log.in_bytes += n as u64;
+        self.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         if self.in_bytes >= 0xf000_0000 {
             debug!("resetting byte counter");
             self.in_bytes = 0;
@@ -604,6 +612,7 @@ impl Session {
             return Ok(Flow::Close);
         };
         self.app = Some(conf);
+        self.ctx.registry.monitor.set_app(self.id, &app, &self.flashver);
         self.app_name = app;
         self.connected = true;
 
@@ -687,6 +696,7 @@ impl Session {
         match self.ctx.registry.publish(self.ctx.index, &app, &name, &self.peer) {
             Ok(stream) => {
                 let push_stop = crate::relay::start_pushes(&self.ctx, &app, &name, redirect_push);
+                self.ctx.registry.monitor.set_role(self.id, Role::Publishing, &name);
                 self.joined = Some(Joined { name, publishing: true, stream, _push_stop: push_stop });
                 self.last_av = Instant::now();
                 self.send(msg::status("NetStream.Publish.Start", "status", "Start publishing"))?;
@@ -752,6 +762,7 @@ impl Session {
                     self.send(msg::status("NetStream.Play.Start", "status", "Start live"))?;
                     self.send(msg::sample_access())?;
                 }
+                self.ctx.registry.monitor.set_role(self.id, Role::Playing, &name);
                 self.joined = Some(Joined { name, publishing: false, stream, _push_stop: None });
                 Ok(Flow::Continue)
             }
@@ -990,6 +1001,7 @@ impl Session {
             debug!("leaving stream '{}' (publishing={})", j.name, j.publishing);
             drop(j.stream);
             self.ctx.registry.leave(self.ctx.index, &self.app_name, &j.name, self.id);
+            self.ctx.registry.monitor.set_role(self.id, Role::Idle, "");
         }
     }
 }

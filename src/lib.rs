@@ -11,6 +11,7 @@ pub mod config;
 pub mod handshake;
 pub mod live;
 pub mod message;
+pub mod monitor;
 pub mod notify;
 pub mod relay;
 pub mod server;

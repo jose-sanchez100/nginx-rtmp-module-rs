@@ -41,6 +41,11 @@ impl Server {
         Ok(Self { listeners, registry })
     }
 
+    /// Bound addresses with the index of their `server {}` block.
+    pub fn listen_info(&self) -> Vec<(usize, SocketAddr)> {
+        self.listeners.iter().filter_map(|(l, c)| Some((c.index, l.local_addr().ok()?))).collect()
+    }
+
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
         self.listeners.iter().filter_map(|(l, _)| l.local_addr().ok()).collect()
     }

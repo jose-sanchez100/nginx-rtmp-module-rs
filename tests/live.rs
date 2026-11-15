@@ -231,3 +231,51 @@ rtmp {
     assert!(combined.contains("] NONE \"\" \"\" \"\" - 0 0 \"\" \"\" (0s)"), "{combined}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn monitor_tracks_and_disconnects() {
+    use rtmp_server::monitor::Role;
+    let server = Server::bind(Config::parse(CONF, "test").unwrap()).await.unwrap();
+    let addr = server.local_addrs()[0];
+    let registry = server.registry.clone();
+    tokio::spawn(server.run());
+
+    let mut publ = Client::connect(addr, "live").await;
+    publ.expect_amf("_result").await;
+    publ.create_stream().await;
+    publ.send(amf_cmd(8, 1, &[Amf0::str("publish"), Amf0::Number(3.0), Amf0::Null, Amf0::str("cam"), Amf0::str("live")])).await;
+    assert_eq!(publ.expect_status().await, "NetStream.Publish.Start");
+    publ.send(amf_data(4, 1, &[
+        Amf0::str("@setDataFrame"),
+        Amf0::str("onMetaData"),
+        Amf0::EcmaArray(vec![("width".into(), Amf0::Number(1280.0)), ("height".into(), Amf0::Number(720.0))]),
+    ])).await;
+
+    let mut play = Client::connect(addr, "live").await;
+    play.expect_amf("_result").await;
+    play.create_stream().await;
+    play.send(amf_cmd(8, 1, &[Amf0::str("play"), Amf0::Number(4.0), Amf0::Null, Amf0::str("cam")])).await;
+    assert_eq!(play.expect_status().await, "NetStream.Play.Start");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let conns = registry.monitor.snapshot();
+    assert_eq!(conns.len(), 2);
+    let p = conns.iter().find(|c| c.role == Role::Publishing).expect("publisher");
+    let v = conns.iter().find(|c| c.role == Role::Playing).expect("player");
+    assert_eq!((p.app.as_str(), p.name.as_str()), ("live", "cam"));
+    assert!(p.bytes_in > 0 && v.bytes_out > 0);
+
+    let streams = registry.streams();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].publisher, Some(p.id));
+    assert_eq!(streams[0].players, vec![v.id]);
+    assert_eq!(streams[0].meta.height, 720.0);
+
+    // Kicking the player closes its socket and removes it.
+    assert!(registry.monitor.disconnect(v.id));
+    while play.recv().await.is_some() {}
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let conns = registry.monitor.snapshot();
+    assert_eq!(conns.len(), 1);
+    assert!(registry.streams()[0].players.is_empty());
+}

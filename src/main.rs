@@ -1,4 +1,6 @@
 mod daemon;
+#[cfg(windows)]
+mod tray;
 
 use rtmp_server::access_log::resolve_path;
 use rtmp_server::config::Config;
@@ -123,11 +125,27 @@ async fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => return fail(format!("signals: {e}")),
     };
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    #[cfg(windows)]
+    let tray = tray::start(tray::TrayOptions {
+        registry: server.registry.clone(),
+        listen: server.listen_info(),
+        conf_path: conf_path.clone(),
+        logs_dir: prefix.join("logs"),
+        stop: stop.clone(),
+    });
+    #[cfg(windows)]
+    if tray.is_none() {
+        tracing::warn!("could not create the tray icon");
+    }
     tokio::select! {
         _ = server.run() => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
         sig = signals => tracing::info!("signal {sig} received, exiting"),
+        _ = stop.notified() => tracing::info!("stopped from the tray icon"),
     }
+    #[cfg(windows)]
+    drop(tray);
     let _ = std::fs::remove_file(&pid_path);
     ExitCode::SUCCESS
 }

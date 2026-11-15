@@ -93,6 +93,21 @@ top-level `error_log file [level]`, default `PREFIX/logs/error.log` at level
 on exit; `-s stop` / `-s quit` stops the running server (a named event on Windows,
 SIGTERM / SIGQUIT elsewhere), so an existing `stop.bat` keeps working.
 
+### Tray icon (Windows, not in nginx)
+
+While serving, the binary shows an icon in the notification area (`src/tray.rs`, fed
+by `src/monitor.rs` and `live::Registry::streams`):
+
+- The nginx icon, with a red dot while any stream has a publisher.
+- Tooltip: live streams, viewer count, total ↓/↑ bitrate.
+- A toast when a stream goes live (resolution, frame rate, codecs, source address)
+  and when it ends (duration, data received); can be turned off from the menu.
+- Menu (left or right click): every stream with resolution, bitrate and viewers; per
+  stream, copy its `rtmp://` URL (local and LAN), watch it in ffplay / VLC when
+  installed, see and disconnect viewers or the publisher; every connection with its
+  role, client, duration, bitrate and totals; open `nginx.conf` / the logs folder;
+  stop the server.
+
 ## Testing
 
 ```bash

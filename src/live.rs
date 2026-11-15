@@ -106,6 +106,20 @@ pub struct Registry {
     streams: Mutex<HashMap<String, StreamRef>>,
     /// Streams with a non-static pull relay in progress (dedupe).
     pulling: Mutex<std::collections::HashSet<String>>,
+    /// Connections, for user interfaces.
+    pub monitor: Arc<crate::monitor::Monitor>,
+}
+
+/// Point-in-time copy of one stream.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub server: usize,
+    pub app: String,
+    pub name: String,
+    pub publisher: Option<SessionId>,
+    pub active: bool,
+    pub players: Vec<SessionId>,
+    pub meta: codec::MetaInfo,
 }
 
 impl Registry {
@@ -218,6 +232,28 @@ impl Registry {
         if empty {
             map.remove(&key);
         }
+    }
+
+    /// Snapshot of every stream, sorted by server, application and name.
+    pub fn streams(&self) -> Vec<StreamInfo> {
+        let map = self.streams.lock().unwrap();
+        let mut v: Vec<StreamInfo> = map
+            .iter()
+            .map(|(k, s)| {
+                let s = s.lock().unwrap();
+                StreamInfo {
+                    server: k.split('/').next().and_then(|n| n.parse().ok()).unwrap_or(0),
+                    app: s.app.name.clone(),
+                    name: s.name.clone(),
+                    publisher: s.publisher,
+                    active: s.active,
+                    players: s.players.iter().map(|p| p.peer.id).collect(),
+                    meta: s.meta_info.clone(),
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| (a.server, &a.app, &a.name).cmp(&(b.server, &b.app, &b.name)));
+        v
     }
 
     /// Snapshot for statistics: (key, publisher present, player count).
