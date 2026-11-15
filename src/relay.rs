@@ -26,9 +26,8 @@ use crate::session::{ServerCtx, next_session_id};
 use bytes::BytesMut;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use crate::tls::{self, BoxIo};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument, debug, info, warn};
 
@@ -61,7 +60,7 @@ pub enum RelayError {
 /// Read side of a relay connection. Protocol-control messages are handled
 /// internally; replies they require (acks, pongs) are queued in `replies`.
 struct Reader {
-    rd: OwnedReadHalf,
+    rd: ReadHalf<BoxIo>,
     dec: ChunkDecoder,
     buf: BytesMut,
     ack_size: u32,
@@ -71,7 +70,7 @@ struct Reader {
 }
 
 struct Writer {
-    wr: OwnedWriteHalf,
+    wr: WriteHalf<BoxIo>,
     enc: ChunkEncoder,
     out: BytesMut,
     timeout: Duration,
@@ -193,10 +192,9 @@ impl Conn {
     }
 
     async fn open_inner(t: &RelayTarget, local_app: &str, conf: &ServerConf) -> Result<Self> {
-        let mut sock = TcpStream::connect((t.host.as_str(), t.port)).await?;
-        let _ = sock.set_nodelay(true);
+        let mut sock = tls::connect(&t.host, t.port, t.tls).await?;
         handshake::client(&mut sock, 0).await?;
-        let (rd, wr) = sock.into_split();
+        let (rd, wr) = tokio::io::split(sock);
         let mut c = Conn {
             rd: Reader {
                 rd,
@@ -214,7 +212,8 @@ impl Conn {
         let app = if t.app.is_empty() { local_app } else { &t.app };
         let tc_url = if t.tc_url.is_empty() {
             let hostport = t.url.split('/').next().unwrap_or(&t.url);
-            format!("rtmp://{hostport}/{app}")
+            let scheme = if t.tls { "rtmps" } else { "rtmp" };
+            format!("{scheme}://{hostport}/{app}")
         } else {
             t.tc_url.clone()
         };

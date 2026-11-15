@@ -7,11 +7,12 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
 /// A bound server, ready to accept connections.
 pub struct Server {
-    listeners: Vec<(TcpListener, Arc<ServerCtx>)>,
+    listeners: Vec<(TcpListener, Arc<ServerCtx>, Option<TlsAcceptor>)>,
     pub registry: Arc<Registry>,
 }
 
@@ -21,11 +22,21 @@ impl Server {
         let registry = Arc::new(Registry::default());
         let mut listeners = Vec::new();
         let mut seen = HashSet::new();
+        let prefix = config.prefix.clone();
         for (index, srv) in config.servers.into_iter().enumerate() {
             let addrs = srv.listen.clone();
+            let acceptor = match (&srv.ssl_certificate, &srv.ssl_certificate_key) {
+                (Some(cert), Some(key)) if srv.listen_ssl.contains(&true) => Some(crate::tls::acceptor(
+                    &crate::access_log::resolve_path(prefix.as_deref(), cert),
+                    &crate::access_log::resolve_path(prefix.as_deref(), key),
+                )?),
+                _ => None,
+            };
+            let ssl = srv.listen_ssl.clone();
             let ctx = Arc::new(ServerCtx::new(index, srv, registry.clone()));
-            for addr in addrs {
-                if !seen.insert(addr) {
+            for (addr, ssl) in addrs.into_iter().zip(ssl) {
+                // Port 0 (any free port) never clashes.
+                if addr.port() != 0 && !seen.insert(addr) {
                     // nginx would pick a server by name; RTMP has no virtual
                     // hosts, so the first server on an address wins.
                     info!("{addr} already bound by an earlier server block, skipping");
@@ -34,30 +45,35 @@ impl Server {
                 let l = TcpListener::bind(addr)
                     .await
                     .map_err(|e| std::io::Error::new(e.kind(), format!("bind {addr} failed: {e}")))?;
-                info!("listening on {}", l.local_addr()?);
-                listeners.push((l, ctx.clone()));
+                let tls = if ssl { acceptor.clone() } else { None };
+                info!("listening on {}{}", l.local_addr()?, if tls.is_some() { " (rtmps)" } else { "" });
+                listeners.push((l, ctx.clone(), tls));
             }
         }
         Ok(Self { listeners, registry })
     }
 
-    /// Bound addresses with the index of their `server {}` block.
-    pub fn listen_info(&self) -> Vec<(usize, SocketAddr)> {
-        self.listeners.iter().filter_map(|(l, c)| Some((c.index, l.local_addr().ok()?))).collect()
+    /// Bound addresses with the index of their `server {}` block and
+    /// whether they take RTMPS.
+    pub fn listen_info(&self) -> Vec<(usize, SocketAddr, bool)> {
+        self.listeners
+            .iter()
+            .filter_map(|(l, c, t)| Some((c.index, l.local_addr().ok()?, t.is_some())))
+            .collect()
     }
 
     pub fn local_addrs(&self) -> Vec<SocketAddr> {
-        self.listeners.iter().filter_map(|(l, _)| l.local_addr().ok()).collect()
+        self.listeners.iter().filter_map(|(l, _, _)| l.local_addr().ok()).collect()
     }
 
     pub async fn run(self) {
         let mut tasks = Vec::new();
         let mut started = HashSet::new();
-        for (l, ctx) in self.listeners {
+        for (l, ctx, tls) in self.listeners {
             if started.insert(ctx.index) {
                 crate::relay::start_static_pulls(&ctx);
             }
-            tasks.push(tokio::spawn(accept_loop(l, ctx)));
+            tasks.push(tokio::spawn(accept_loop(l, ctx, tls)));
         }
         for t in tasks {
             let _ = t.await;
@@ -65,7 +81,7 @@ impl Server {
     }
 }
 
-async fn accept_loop(l: TcpListener, ctx: Arc<ServerCtx>) {
+async fn accept_loop(l: TcpListener, ctx: Arc<ServerCtx>, tls: Option<TlsAcceptor>) {
     loop {
         match l.accept().await {
             Ok((sock, addr)) => {
@@ -73,7 +89,21 @@ async fn accept_loop(l: TcpListener, ctx: Arc<ServerCtx>) {
                 if ctx.conf.so_keepalive {
                     let _ = socket2_keepalive(&sock);
                 }
-                tokio::spawn(session::serve(sock, addr, ctx.clone()));
+                match &tls {
+                    None => {
+                        tokio::spawn(session::serve(sock, addr, ctx.clone()));
+                    }
+                    Some(acceptor) => {
+                        let (acceptor, ctx) = (acceptor.clone(), ctx.clone());
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(ctx.conf.timeout, acceptor.accept(sock)).await {
+                                Ok(Ok(stream)) => session::serve(stream, addr, ctx).await,
+                                Ok(Err(e)) => info!("{addr}: TLS handshake failed: {e}"),
+                                Err(_) => info!("{addr}: TLS handshake timed out"),
+                            }
+                        });
+                    }
+                }
             }
             Err(e) => {
                 error!("accept failed: {e}");

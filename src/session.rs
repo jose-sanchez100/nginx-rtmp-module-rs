@@ -902,7 +902,7 @@ impl Session {
         match notify::call(url, app.notify.method, form, self.ctx.conf.netcall_timeout).await {
             Reply::Ok | Reply::Redirect(None) => Some(None),
             Reply::Redirect(Some(loc)) => {
-                if loc.len() < 7 || !loc[..7].eq_ignore_ascii_case("rtmp://") {
+                if !crate::config::is_rtmp_url(&loc) {
                     info!("notify: {what} redirect to '{loc}'");
                     *name = loc;
                     return Some(None);

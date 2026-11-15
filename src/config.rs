@@ -316,6 +316,11 @@ impl Default for AppConf {
 #[derive(Debug, Clone)]
 pub struct ServerConf {
     pub listen: Vec<SocketAddr>,
+    /// For each `listen` entry, whether it is marked `ssl` (RTMPS).
+    pub listen_ssl: Vec<bool>,
+    /// `ssl_certificate` / `ssl_certificate_key` (PEM), for `listen ... ssl`.
+    pub ssl_certificate: Option<String>,
+    pub ssl_certificate_key: Option<String>,
     pub timeout: Duration,
     pub ping: Duration,
     pub ping_timeout: Duration,
@@ -344,6 +349,9 @@ impl Default for ServerConf {
     fn default() -> Self {
         Self {
             listen: Vec::new(),
+            listen_ssl: Vec::new(),
+            ssl_certificate: None,
+            ssl_certificate_key: None,
             timeout: Duration::from_secs(60),
             ping: Duration::from_secs(60),
             ping_timeout: Duration::from_secs(30),
@@ -480,6 +488,15 @@ impl Config {
             }
             if srv.listen.is_empty() {
                 srv.listen.push("0.0.0.0:1935".parse().unwrap());
+                srv.listen_ssl.push(false);
+            }
+            if let Some(addr) = srv.listen.iter().zip(&srv.listen_ssl).find_map(|(a, &ssl)| ssl.then_some(a)) {
+                if srv.ssl_certificate.is_none() {
+                    return Err(cx.err(s.line, format!("no \"ssl_certificate\" is defined for the \"listen {addr} ssl\"")));
+                }
+                if srv.ssl_certificate_key.is_none() {
+                    return Err(cx.err(s.line, format!("no \"ssl_certificate_key\" is defined for the \"listen {addr} ssl\"")));
+                }
             }
             servers.push(srv);
         }
@@ -581,12 +598,18 @@ impl Cx<'_> {
             "listen" => {
                 let v = d.args.first().ok_or_else(|| self.err(d.line, "\"listen\" needs an address"))?;
                 let addr = parse_listen(v).ok_or_else(|| self.err(d.line, format!("invalid listen \"{v}\"")))?;
+                let mut ssl = false;
                 for extra in &d.args[1..] {
-                    if !matches!(extra.as_str(), "bind" | "ipv6only=on" | "ipv6only=off") && !extra.starts_with("so_keepalive") {
+                    if extra == "ssl" {
+                        ssl = true;
+                    } else if !matches!(extra.as_str(), "bind" | "ipv6only=on" | "ipv6only=off")
+                        && !extra.starts_with("so_keepalive")
+                    {
                         self.warnings.push(format!("{}:{}: listen option \"{extra}\" ignored", self.file, d.line));
                     }
                 }
                 s.listen.push(addr);
+                s.listen_ssl.push(ssl);
             }
             "timeout" => s.timeout = self.time(d)?,
             "ping" => s.ping = self.time(d)?,
@@ -608,6 +631,8 @@ impl Cx<'_> {
             "busy" => s.busy = self.flag(d)?,
             "buflen" => s.buflen = self.time(d)?,
             "so_keepalive" => s.so_keepalive = self.flag(d)?,
+            "ssl_certificate" => s.ssl_certificate = Some(self.one(d)?.to_string()),
+            "ssl_certificate_key" => s.ssl_certificate_key = Some(self.one(d)?.to_string()),
             "on_connect" => s.notify.on_connect = Some(self.notify_url(d)?),
             "on_disconnect" => s.notify.on_disconnect = Some(self.notify_url(d)?),
             "netcall_timeout" => s.netcall_timeout = self.time(d)?,
@@ -780,12 +805,34 @@ pub struct RelayTarget {
     pub start: i64,
     pub stop: i64,
     pub is_static: bool,
+    /// `rtmps://`: connect over TLS.
+    pub tls: bool,
+}
+
+/// Split a `rtmp://` / `rtmps://` scheme off `url`: (TLS, rest). A URL
+/// without a scheme is plain RTMP.
+pub fn split_scheme(url: &str) -> (bool, &str) {
+    let lower = |n: usize| url.get(..n).map(str::to_ascii_lowercase);
+    if lower(8).as_deref() == Some("rtmps://") {
+        (true, &url[8..])
+    } else if lower(7).as_deref() == Some("rtmp://") {
+        (false, &url[7..])
+    } else {
+        (false, url)
+    }
+}
+
+/// Whether `url` starts with `rtmp://` or `rtmps://`.
+pub fn is_rtmp_url(url: &str) -> bool {
+    split_scheme(url).1.len() != url.len()
 }
 
 impl RelayTarget {
-    /// Parse `[rtmp://]host[:port][/app[/play/path]]`.
+    /// Parse `[rtmp[s]://]host[:port][/app[/play/path]]`. The default port
+    /// is 1935, or 443 for `rtmps://`.
     pub fn parse_url(url: &str) -> Option<Self> {
-        let rest = if url.len() >= 7 && url[..7].eq_ignore_ascii_case("rtmp://") { &url[7..] } else { url };
+        let (tls, rest) = split_scheme(url);
+        let default_port = if tls { 443 } else { 1935 };
         let (hostport, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => (rest, ""),
@@ -794,14 +841,14 @@ impl RelayTarget {
             let (h, after) = h.split_once(']')?;
             let port = match after.strip_prefix(':') {
                 Some(p) => p.parse().ok()?,
-                None if after.is_empty() => 1935,
+                None if after.is_empty() => default_port,
                 None => return None,
             };
             (h.to_string(), port)
         } else {
             match hostport.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse().ok()?),
-                None => (hostport.to_string(), 1935),
+                None => (hostport.to_string(), default_port),
             }
         };
         if host.is_empty() {
@@ -811,7 +858,7 @@ impl RelayTarget {
             Some((a, p)) => (a.to_string(), p.to_string()),
             None => (path.to_string(), String::new()),
         };
-        Some(RelayTarget { url: rest.to_string(), host, port, app, play_path, ..Default::default() })
+        Some(RelayTarget { url: rest.to_string(), host, port, app, play_path, tls, ..Default::default() })
     }
 
     /// `name=` filter.

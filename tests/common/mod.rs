@@ -8,12 +8,13 @@ use rtmp_server::handshake;
 use rtmp_server::message::*;
 use std::net::SocketAddr;
 use std::time::Duration;
+use rtmp_server::tls::BoxIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 pub struct Client {
-    sock: TcpStream,
+    sock: BoxIo,
     enc: ChunkEncoder,
     dec: ChunkDecoder,
     buf: BytesMut,
@@ -24,6 +25,16 @@ impl Client {
         let mut sock = TcpStream::connect(addr).await.unwrap();
         let ch = handshake::client(&mut sock, 0).await.unwrap();
         assert!(ch.digest.is_some(), "server should answer with a complex handshake");
+        Self::after_handshake(Box::new(sock), &format!("rtmp://{addr}/{app}"), app).await
+    }
+
+    /// Handshake and `connect` over an already open connection (e.g. TLS).
+    pub async fn connect_io(mut sock: BoxIo, tc_url: &str, app: &str) -> Self {
+        handshake::client(&mut sock, 0).await.unwrap();
+        Self::after_handshake(sock, tc_url, app).await
+    }
+
+    async fn after_handshake(sock: BoxIo, tc_url: &str, app: &str) -> Self {
         let mut c = Client {
             sock,
             enc: ChunkEncoder::default(),
@@ -38,7 +49,7 @@ impl Client {
                 Amf0::Number(1.0),
                 Amf0::object([
                     ("app", Amf0::str(app)),
-                    ("tcUrl", Amf0::str(format!("rtmp://{addr}/{app}"))),
+                    ("tcUrl", Amf0::str(tc_url)),
                     ("objectEncoding", Amf0::Number(0.0)),
                 ]),
             ],

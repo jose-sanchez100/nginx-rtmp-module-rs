@@ -35,7 +35,7 @@ const CLASS: &str = "rtmp-server-tray";
 /// What the tray needs to know about the running server.
 pub struct TrayOptions {
     pub registry: Arc<Registry>,
-    pub listen: Vec<(usize, SocketAddr)>,
+    pub listen: Vec<(usize, SocketAddr, bool)>,
     pub conf_path: PathBuf,
     pub logs_dir: PathBuf,
     /// Notified when the user picks "Stop server".
@@ -506,17 +506,21 @@ impl State {
     /// `rtmp://` URLs to reach a stream: local, and on the LAN when the
     /// server listens on every interface.
     fn urls(&self, s: &StreamInfo) -> Vec<(&'static str, String)> {
-        let Some(&(_, addr)) = self.opts.listen.iter().find(|(i, _)| *i == s.server) else { return vec![] };
-        let port = if addr.port() == 1935 { String::new() } else { format!(":{}", addr.port()) };
+        // Prefer a plain listener: players connect to it without certificate trouble.
+        let mut mine: Vec<_> = self.opts.listen.iter().filter(|(i, _, _)| *i == s.server).collect();
+        mine.sort_by_key(|(_, _, tls)| *tls);
+        let Some(&&(_, addr, tls)) = mine.first() else { return vec![] };
+        let (scheme, default_port) = if tls { ("rtmps", 443) } else { ("rtmp", 1935) };
+        let port = if addr.port() == default_port { String::new() } else { format!(":{}", addr.port()) };
         let path = format!("{}/{}", s.app, s.name);
         let mut v = Vec::new();
         if addr.ip().is_unspecified() {
-            v.push(("Copy URL", format!("rtmp://127.0.0.1{port}/{path}")));
+            v.push(("Copy URL", format!("{scheme}://127.0.0.1{port}/{path}")));
             if let Some(ip) = self.lan_ip {
-                v.push(("Copy LAN URL", format!("rtmp://{ip}{port}/{path}")));
+                v.push(("Copy LAN URL", format!("{scheme}://{ip}{port}/{path}")));
             }
         } else {
-            v.push(("Copy URL", format!("rtmp://{}{port}/{path}", addr.ip())));
+            v.push(("Copy URL", format!("{scheme}://{}{port}/{path}", addr.ip())));
         }
         v
     }
@@ -526,7 +530,12 @@ impl State {
         self.actions.clear();
         let root = Self::new_menu();
 
-        let ports: Vec<String> = self.opts.listen.iter().map(|(_, a)| a.to_string()).collect();
+        let ports: Vec<String> = self
+            .opts
+            .listen
+            .iter()
+            .map(|(_, a, tls)| if *tls { format!("{a} (rtmps)") } else { a.to_string() })
+            .collect();
         self.add(root, &format!("rtmp-server · {}", ports.join(", ")), None, 0);
         let (rin, rout) = self.totals();
         self.add(
@@ -550,7 +559,7 @@ impl State {
                 .opts
                 .listen
                 .first()
-                .map(|(_, a)| format!("No streams · publish to rtmp://127.0.0.1:{}/<app>/<key>", a.port()))
+                .map(|(_, a, _)| format!("No streams · publish to rtmp://127.0.0.1:{}/<app>/<key>", a.port()))
                 .unwrap_or_else(|| "No streams".into());
             self.add(root, &hint, None, 0);
         }

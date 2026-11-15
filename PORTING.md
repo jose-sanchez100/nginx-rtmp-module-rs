@@ -38,7 +38,7 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_limit_module.c` | — | ⬜ `max_connections` |
 | `ngx_rtmp_record_module.c` + `ngx_rtmp_flv_module.c` | — | ⬜ FLV recording |
 | `ngx_rtmp_play_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
-| `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull`, `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
+| `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull` (also `rtmps://`, see below), `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
 | `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` is parsed but waits for `record` |
 | `ngx_rtmp_exec_module.c` | — | ⬜ `exec*` |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
@@ -58,7 +58,7 @@ The port is a **standalone RTMP server** on `tokio`:
   applications (in nginx they stay in the configuration level where they are written).
 - Non-static pull: if the upstream drops, local players are disconnected (same as
   nginx's "play disconnect orphan"); there is no automatic retry.
-- `listen` accepts `port`, `ip:port`, `*:port`; extra options are ignored.
+- `listen` accepts `port`, `ip:port`, `*:port` and the `ssl` flag; other options are ignored.
 - Notify: while `on_connect` / `on_publish` / `on_play` is pending, the session stops
   reading from the client (nginx keeps reading and processes later commands). Relay
   connections never trigger callbacks. `on_disconnect` is only sent for sessions that
@@ -92,6 +92,22 @@ top-level `error_log file [level]`, default `PREFIX/logs/error.log` at level
 `error`. The PID is written to `pid` (default `PREFIX/logs/nginx.pid`) and removed
 on exit; `-s stop` / `-s quit` stops the running server (a named event on Windows,
 SIGTERM / SIGQUIT elsewhere), so an existing `stop.bat` keeps working.
+
+### RTMPS (not in nginx)
+
+nginx-rtmp-module needs an external TLS proxy (stunnel, or nginx `stream { ssl }`)
+for RTMPS. The port does it natively (`src/tls.rs`, rustls with `ring`):
+
+- `push` / `pull` accept `rtmps://host[:port]/app/...` (default port 443), e.g.
+  `push rtmps://live-api-s.facebook.com:443/rtmp/;` or
+  `push rtmps://a.rtmps.youtube.com/live2/;`. Server certificates are checked
+  against Mozilla's root list (`webpki-roots`) and the host name. The default
+  `tcUrl` uses the `rtmps://` scheme. `on_publish` / `on_play` redirects may also
+  return an `rtmps://` URL.
+- `listen PORT ssl;` accepts RTMPS clients, with `ssl_certificate` and
+  `ssl_certificate_key` (PEM, nginx syntax; relative paths resolve against the
+  prefix) in `server {}` or `rtmp {}`. Plain and `ssl` listeners can be mixed.
+- A TLS peer that closes without `close_notify` is treated as a normal close.
 
 ### Tray icon (Windows, not in nginx)
 
