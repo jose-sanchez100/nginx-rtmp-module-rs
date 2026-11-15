@@ -3,6 +3,7 @@
 //! A standalone, async RTMP server that keeps nginx-rtmp's protocol behaviour
 //! and reads the same `rtmp { ... }` configuration syntax.
 
+pub mod access_log;
 pub mod amf;
 pub mod chunk;
 pub mod codec;

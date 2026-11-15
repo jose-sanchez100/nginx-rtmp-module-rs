@@ -9,9 +9,10 @@
 //! directives written in `rtmp {}` / `server {}` are defaults for every
 //! `application {}`. Unsupported directives are logged and ignored.
 
+use crate::access_log::{LogFormat, LogTarget};
 use crate::notify::{AppNotify, Method, NotifyUrl, SrvNotify};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -239,6 +240,18 @@ pub enum MetaMode {
     Off,
 }
 
+/// `access_log` setting at one level (`ngx_rtmp_log_app_conf_t`). A level
+/// with its own `access_log` directives replaces the inherited ones.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum AccessLogConf {
+    /// No directive at any level: nginx logs to `logs/access.log`.
+    #[default]
+    Unset,
+    Off,
+    /// (path as written, format name)
+    Logs(Vec<(String, String)>),
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConf {
     pub name: String,
@@ -266,6 +279,10 @@ pub struct AppConf {
     pub relay_buffer: Duration,
     // notify module
     pub notify: AppNotify,
+    // log module
+    pub access_log: AccessLogConf,
+    /// Opened targets for `access_log` (filled by `access_log::open_all`).
+    pub access_logs: Vec<LogTarget>,
 }
 
 impl Default for AppConf {
@@ -290,6 +307,8 @@ impl Default for AppConf {
             pull_reconnect: Duration::from_secs(3),
             relay_buffer: Duration::from_secs(5),
             notify: AppNotify::new(),
+            access_log: AccessLogConf::Unset,
+            access_logs: Vec::new(),
         }
     }
 }
@@ -315,6 +334,9 @@ pub struct ServerConf {
     pub notify: SrvNotify,
     /// `netcall_timeout`: limit for each HTTP callback.
     pub netcall_timeout: Duration,
+    /// `access_log` for connections that never select an application.
+    pub access_log: AccessLogConf,
+    pub access_logs: Vec<LogTarget>,
     pub applications: Vec<AppConf>,
 }
 
@@ -338,6 +360,8 @@ impl Default for ServerConf {
             so_keepalive: false,
             notify: SrvNotify::default(),
             netcall_timeout: Duration::from_secs(10),
+            access_log: AccessLogConf::Unset,
+            access_logs: Vec::new(),
             applications: Vec::new(),
         }
     }
@@ -355,6 +379,12 @@ impl ServerConf {
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub servers: Vec<ServerConf>,
+    /// `log_format` definitions, `combined` first.
+    pub log_formats: Vec<(String, LogFormat)>,
+    /// Directory relative paths (log files) are resolved against, like
+    /// nginx's `-p` prefix. `None` resolves against the working directory
+    /// and disables the implicit `logs/access.log`.
+    pub prefix: Option<PathBuf>,
 }
 
 impl Config {
@@ -366,7 +396,11 @@ impl Config {
 
     pub fn parse(src: &str, file: &str) -> Result<Self, ConfigError> {
         let tree = parse_tree(src, file)?;
-        let mut cx = Cx { file, warnings: Vec::new() };
+        let mut cx = Cx {
+            file,
+            warnings: Vec::new(),
+            formats: vec![("combined".to_string(), LogFormat::combined())],
+        };
         let rtmp = tree
             .iter()
             .find(|d| d.name == "rtmp" && d.block.is_some())
@@ -385,9 +419,14 @@ impl Config {
             let block = s.block.as_ref().ok_or_else(|| cx.err(s.line, "\"server\" needs a block"))?;
             let mut srv = srv_defaults.clone();
             let mut app_def = app_defaults.clone();
+            let inherited_log = std::mem::take(&mut app_def.access_log);
             for d in block.iter().filter(|d| d.name != "application") {
                 cx.apply_any(d, Some(&mut srv), &mut app_def)?;
             }
+            if app_def.access_log == AccessLogConf::Unset {
+                app_def.access_log = inherited_log;
+            }
+            srv.access_log = app_def.access_log.clone();
             for a in block.iter().filter(|d| d.name == "application") {
                 let name = a.args.first().ok_or_else(|| cx.err(a.line, "\"application\" needs a name"))?;
                 let ablock = a.block.as_ref().ok_or_else(|| cx.err(a.line, "\"application\" needs a block"))?;
@@ -395,11 +434,15 @@ impl Config {
                 app.name = name.clone();
                 // access rules accumulate in order: inherited only if none set locally
                 let inherited_access = std::mem::take(&mut app.access);
+                let inherited_log = std::mem::take(&mut app.access_log);
                 for d in ablock {
                     cx.apply_any(d, None, &mut app)?;
                 }
                 if app.access.is_empty() {
                     app.access = inherited_access;
+                }
+                if app.access_log == AccessLogConf::Unset {
+                    app.access_log = inherited_log;
                 }
                 srv.applications.push(app);
             }
@@ -411,13 +454,14 @@ impl Config {
         for w in cx.warnings {
             tracing::warn!("{w}");
         }
-        Ok(Config { servers })
+        Ok(Config { servers, log_formats: cx.formats, prefix: None })
     }
 }
 
 struct Cx<'a> {
     file: &'a str,
     warnings: Vec<String>,
+    formats: Vec<(String, LogFormat)>,
 }
 
 impl Cx<'_> {
@@ -457,6 +501,22 @@ impl Cx<'_> {
         srv: Option<&mut ServerConf>,
         app: &mut AppConf,
     ) -> Result<(), ConfigError> {
+        if d.name == "log_format" {
+            // nginx only honours it at rtmp{} level (with a warning
+            // elsewhere); formats are global either way.
+            let [name, parts @ ..] = d.args.as_slice() else {
+                return Err(self.err(d.line, "invalid number of arguments in \"log_format\""));
+            };
+            if parts.is_empty() {
+                return Err(self.err(d.line, "invalid number of arguments in \"log_format\""));
+            }
+            if self.formats.iter().any(|(n, _)| n == name) {
+                return Err(self.err(d.line, format!("duplicate \"log_format\" name \"{name}\"")));
+            }
+            let f = LogFormat::compile(parts).map_err(|e| self.err(d.line, e))?;
+            self.formats.push((name.clone(), f));
+            return Ok(());
+        }
         if d.name == "notify_method" {
             // Applies to both the app callbacks and on_connect/on_disconnect.
             let m = match self.one(d)?.to_ascii_lowercase().as_str() {
@@ -538,6 +598,22 @@ impl Cx<'_> {
             "play_restart" => a.play_restart = self.flag(d)?,
             "idle_streams" => a.idle_streams = self.flag(d)?,
             "drop_idle_publisher" => a.drop_idle_publisher = Some(self.time(d)?),
+            "access_log" => match d.args.as_slice() {
+                [off] if off == "off" => a.access_log = AccessLogConf::Off,
+                [path] | [path, _] => {
+                    let fmt = d.args.get(1).map_or("combined", String::as_str);
+                    if !self.formats.iter().any(|(n, _)| n == fmt) {
+                        return Err(self.err(d.line, format!("unknown log format \"{fmt}\"")));
+                    }
+                    let entry = (path.clone(), fmt.to_string());
+                    match &mut a.access_log {
+                        AccessLogConf::Off => {}
+                        AccessLogConf::Logs(v) => v.push(entry),
+                        AccessLogConf::Unset => a.access_log = AccessLogConf::Logs(vec![entry]),
+                    }
+                }
+                _ => return Err(self.err(d.line, "invalid number of arguments in \"access_log\"")),
+            },
             "stream_buckets" | "buffer" => {} // tuning knobs with no equivalent; accepted silently
             "meta" => {
                 a.meta = match self.one(d)? {
@@ -888,5 +964,53 @@ http { server { listen 8080; location / { root html; } } }
     fn syntax_error_reports_line() {
         let e = Config::parse("rtmp {\n server {\n listen 1935\n }\n}", "x").unwrap_err();
         assert!(e.to_string().contains("x:3"), "{e}");
+    }
+
+    #[test]
+    fn access_log_inheritance() {
+        let c = Config::parse(
+            r#"
+rtmp {
+    log_format short '$remote_addr $command' ' $app';
+    access_log logs/rtmp.log;
+    server {
+        listen 1935;
+        application a { live on; }
+        application b { access_log /tmp/b.log short; access_log x.log; }
+        application c { access_log off; }
+    }
+    server {
+        listen 1936;
+        access_log off;
+        application d { live on; }
+    }
+}
+"#,
+            "t",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        let rtmp = AccessLogConf::Logs(vec![("logs/rtmp.log".into(), "combined".into())]);
+        assert_eq!(s.access_log, rtmp);
+        assert_eq!(s.app("a").unwrap().access_log, rtmp);
+        assert_eq!(
+            s.app("b").unwrap().access_log,
+            AccessLogConf::Logs(vec![("/tmp/b.log".into(), "short".into()), ("x.log".into(), "combined".into())])
+        );
+        assert_eq!(s.app("c").unwrap().access_log, AccessLogConf::Off);
+        assert_eq!(c.servers[1].app("d").unwrap().access_log, AccessLogConf::Off);
+        assert_eq!(c.log_formats.len(), 2);
+
+        let unset = Config::parse("rtmp { server { application a {} } }", "t").unwrap();
+        assert_eq!(unset.servers[0].app("a").unwrap().access_log, AccessLogConf::Unset);
+
+        for bad in [
+            "rtmp { access_log a.log nope; server {} }",
+            "rtmp { log_format combined '$app'; server {} }",
+            "rtmp { log_format x '$bogus'; server {} }",
+            "rtmp { access_log; server {} }",
+        ] {
+            assert!(Config::parse(bad, "t").is_err(), "{bad}");
+        }
     }
 }

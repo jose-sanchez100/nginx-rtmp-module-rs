@@ -9,6 +9,7 @@
 //! Each session runs a reader loop and a separate writer task fed by a
 //! bounded channel; the channel bound is the `out_queue` setting.
 
+use crate::access_log;
 use crate::amf::{self, Amf0};
 use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
@@ -130,6 +131,17 @@ struct Session {
     /// Timestamp of the last received message (`s->current_time`).
     last_ts: Arc<AtomicU32>,
     notify: Option<NotifyState>,
+    /// Access log values (`ngx_rtmp_log_ctx_t` + session counters).
+    log: LogCtx,
+}
+
+#[derive(Default)]
+struct LogCtx {
+    play: bool,
+    publish: bool,
+    name: String,
+    args: String,
+    in_bytes: u64,
 }
 
 /// Run a session on an accepted connection until it closes.
@@ -155,15 +167,24 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let conf = &ctx.conf;
-    tokio::time::timeout(conf.timeout, handshake::server(&mut io, epoch_ms()))
+    let started = Instant::now();
+    let hs = tokio::time::timeout(conf.timeout, handshake::server(&mut io, epoch_ms()))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out"))??;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out"));
+    if let Err(e) | Ok(Err(e)) = hs {
+        // nginx logs every closed connection, even before the handshake.
+        let mut e2 = access_log::LogEntry::new(id, addr.ip());
+        e2.session_secs = started.elapsed().as_secs();
+        access_log::write(&ctx.conf.access_logs, &e2);
+        return Err(e.into());
+    }
     debug!("handshake done");
 
     let (mut rd, wr) = tokio::io::split(io);
     let (tx, rx) = mpsc::channel(conf.out_queue.max(8));
     let close = Arc::new(Notify::new());
-    let writer = tokio::spawn(writer_task(wr, rx, conf.timeout, close.clone()).in_current_span());
+    let out_bytes = Arc::new(AtomicU64::new(0));
+    let writer = tokio::spawn(writer_task(wr, rx, conf.timeout, close.clone(), out_bytes.clone()).in_current_span());
 
     let mut s = Session {
         id,
@@ -188,15 +209,35 @@ where
         last_av: Instant::now(),
         last_ts: Arc::new(AtomicU32::new(0)),
         notify: None,
+        log: LogCtx::default(),
     };
 
     let result = s.read_loop(&mut rd).await;
     s.leave_stream();
     s.notify_done();
     s.notify_disconnect();
-    let Session { peer, .. } = s;
+    let Session { peer, app, app_name, flashver, swf_url, tc_url, page_url, log, .. } = s;
     drop(peer); // closes the channel; writer flushes what is queued and exits
     let _ = tokio::time::timeout(conf.timeout, writer).await;
+
+    // ngx_rtmp_log_disconnect
+    let targets = app.as_ref().map_or(&ctx.conf.access_logs, |a| &a.access_logs);
+    let entry = access_log::LogEntry {
+        app: app_name,
+        flashver,
+        swf_url,
+        tc_url,
+        page_url,
+        play: log.play,
+        publish: log.publish,
+        name: log.name,
+        args: log.args,
+        bytes_sent: out_bytes.load(Ordering::Relaxed),
+        bytes_received: log.in_bytes,
+        session_secs: started.elapsed().as_secs(),
+        ..access_log::LogEntry::new(id, addr.ip())
+    };
+    access_log::write(targets, &entry);
     result
 }
 
@@ -205,6 +246,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<Message>,
     timeout: Duration,
     close: Arc<Notify>,
+    out_bytes: Arc<AtomicU64>,
 ) {
     let mut enc = ChunkEncoder::default();
     let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -225,7 +267,10 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             }
         }
         match tokio::time::timeout(timeout, w.write_all(&buf)).await {
-            Ok(Ok(())) => buf.clear(),
+            Ok(Ok(())) => {
+                out_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                buf.clear();
+            }
             Ok(Err(e)) => {
                 debug!("write error: {e}");
                 close.notify_one();
@@ -319,6 +364,7 @@ impl Session {
 
     fn account_in(&mut self, n: usize) -> Result<()> {
         self.in_bytes = self.in_bytes.wrapping_add(n as u32);
+        self.log.in_bytes += n as u64;
         if self.in_bytes >= 0xf000_0000 {
             debug!("resetting byte counter");
             self.in_bytes = 0;
@@ -608,6 +654,7 @@ impl Session {
         let (name, args) = full_name.split_once('?').unwrap_or((full_name, ""));
         let mut name = name.to_string();
         info!("publish: name='{name}' args='{args}' type='{kind}'");
+        self.log_names(&name, args, true);
         if !self.access_allowed(true) {
             info!("access forbidden: publish");
             return Ok(Flow::Close);
@@ -658,6 +705,7 @@ impl Session {
         let (name, args) = full_name.split_once('?').unwrap_or((full_name, ""));
         let mut name = name.to_string();
         info!("play: name='{name}' args='{args}'");
+        self.log_names(&name, args, false);
         if !self.access_allowed(false) {
             info!("access forbidden: play");
             return Ok(Flow::Close);
@@ -924,6 +972,17 @@ impl Session {
             }
             .in_current_span(),
         );
+    }
+
+    /// `ngx_rtmp_log_publish` / `ngx_rtmp_log_play`.
+    fn log_names(&mut self, name: &str, args: &str, publish: bool) {
+        self.log.name = name.to_string();
+        self.log.args = args.to_string();
+        if publish {
+            self.log.publish = true;
+        } else {
+            self.log.play = true;
+        }
     }
 
     fn leave_stream(&mut self) {

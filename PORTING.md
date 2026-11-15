@@ -42,7 +42,7 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` is parsed but waits for `record` |
 | `ngx_rtmp_exec_module.c` | — | ⬜ `exec*` |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
-| `ngx_rtmp_log_module.c` | — | ⬜ `access_log` (currently: `tracing`) |
+| `ngx_rtmp_log_module.c` | `access_log.rs` | ✅ `access_log`, `log_format`, all variables |
 | `ngx_rtmp_stat_module.c`, `ngx_rtmp_control_module.c` | — | ⬜ need an HTTP endpoint of their own |
 | `hls/` | — | ⬜ MPEG-TS + m3u8 |
 | `dash/` | — | ⬜ fMP4 + MPD |
@@ -65,6 +65,21 @@ The port is a **standalone RTMP server** on `tokio`:
   issued `connect`. `on_play` always reports `start=0&duration=0&reset=0`.
   `notify_method` written inside `application {}` does not affect `on_connect` /
   `on_disconnect`. `netcall_buffer` is accepted and ignored.
+- Access log: missing log directories are created (nginx fails to start). The implicit
+  `logs/access.log` (no `access_log` anywhere) only applies to the binary, not to
+  configurations built with `Config::parse` (tests, embedding). `log_format` is
+  accepted at any level without nginx's warning. `$bytes_received` / `$bytes_sent` are
+  64-bit totals after the handshake (nginx's 32-bit counter resets near 4 GB).
+
+## Running
+
+Like nginx, the binary has a prefix directory: relative paths in the configuration
+(`access_log logs/access.log`) are resolved against it. It defaults to the directory
+of the executable, and the configuration to `PREFIX/conf/nginx.conf`, so dropping
+`rtmp-server.exe` into an nginx folder and running it with no arguments works.
+`-p DIR` sets the prefix, `-c FILE` the configuration. Without `-p`, when
+`PREFIX/conf/nginx.conf` doesn't exist (e.g. `cargo run`), `conf/nginx.conf` in the
+working directory is used and the working directory becomes the prefix.
 
 ## Testing
 

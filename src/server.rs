@@ -16,7 +16,8 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn bind(config: Config) -> std::io::Result<Self> {
+    pub async fn bind(mut config: Config) -> std::io::Result<Self> {
+        crate::access_log::open_all(&mut config)?;
         let registry = Arc::new(Registry::default());
         let mut listeners = Vec::new();
         let mut seen = HashSet::new();
@@ -30,7 +31,9 @@ impl Server {
                     info!("{addr} already bound by an earlier server block, skipping");
                     continue;
                 }
-                let l = TcpListener::bind(addr).await?;
+                let l = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("bind {addr} failed: {e}")))?;
                 info!("listening on {}", l.local_addr()?);
                 listeners.push((l, ctx.clone()));
             }
