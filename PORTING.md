@@ -39,7 +39,7 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_record_module.c` + `ngx_rtmp_flv_module.c` | — | ⬜ FLV recording |
 | `ngx_rtmp_play_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
 | `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull`, `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
-| `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | — | ⬜ `on_publish`, `on_play`… (HTTP callbacks) |
+| `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` is parsed but waits for `record` |
 | `ngx_rtmp_exec_module.c` | — | ⬜ `exec*` |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
 | `ngx_rtmp_log_module.c` | — | ⬜ `access_log` (currently: `tracing`) |
@@ -59,6 +59,12 @@ The port is a **standalone RTMP server** on `tokio`:
 - Non-static pull: if the upstream drops, local players are disconnected (same as
   nginx's "play disconnect orphan"); there is no automatic retry.
 - `listen` accepts `port`, `ip:port`, `*:port`; extra options are ignored.
+- Notify: while `on_connect` / `on_publish` / `on_play` is pending, the session stops
+  reading from the client (nginx keeps reading and processes later commands). Relay
+  connections never trigger callbacks. `on_disconnect` is only sent for sessions that
+  issued `connect`. `on_play` always reports `start=0&duration=0&reset=0`.
+  `notify_method` written inside `application {}` does not affect `on_connect` /
+  `on_disconnect`. `netcall_buffer` is accepted and ignored.
 
 ## Testing
 
@@ -71,6 +77,6 @@ ffplay rtmp://127.0.0.1/live/test
 
 ## Suggested next steps
 
-1. `record` (FLV) — reuses the `live` flow as is.
-2. `notify` (`on_publish`…), widely used for authentication.
-3. SPS/ASC parsing in `codec` → `hls` → `stat`.
+1. SPS/ASC parsing in `codec` → `hls`.
+2. `record` (FLV) — reuses the `live` flow as is; then wire `on_record_done`.
+3. `stat` / `control` (HTTP endpoint).

@@ -289,10 +289,16 @@ impl Conn {
 // push
 // ---------------------------------------------------------------------------
 
-/// Start pushes for a freshly published local stream. Dropping the returned
-/// sender (when the publisher leaves) stops them.
-pub fn start_pushes(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str) -> Option<watch::Sender<()>> {
-    let targets: Vec<_> = app.pushes.iter().filter(|t| t.matches(name)).cloned().collect();
+/// Start pushes for a freshly published local stream: the configured ones
+/// plus `extra` (an `on_publish` redirect to an `rtmp://` URL). Dropping the
+/// returned sender (when the publisher leaves) stops them.
+pub fn start_pushes(
+    ctx: &Arc<ServerCtx>,
+    app: &Arc<AppConf>,
+    name: &str,
+    extra: Option<Arc<RelayTarget>>,
+) -> Option<watch::Sender<()>> {
+    let targets: Vec<_> = extra.into_iter().chain(app.pushes.iter().filter(|t| t.matches(name)).cloned()).collect();
     if targets.is_empty() {
         return None;
     }
@@ -401,12 +407,13 @@ async fn push_once(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str, t: &Rel
 // pull
 // ---------------------------------------------------------------------------
 
-/// Called when a local client plays `name`: start a pull if configured and
-/// the stream has no local publisher or running pull.
-pub fn maybe_pull(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str) {
+/// Called when a local client plays `name`: start a pull if configured (or
+/// requested by an `on_play` redirect, `target`) and the stream has no local
+/// publisher or running pull.
+pub fn maybe_pull(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str, target: Option<Arc<RelayTarget>>) {
     // nginx uses only the first matching target (later ones find the relay
     // context already registered under this name).
-    let Some(t) = app.pulls.iter().find(|t| t.matches(name)).cloned() else { return };
+    let Some(t) = target.or_else(|| app.pulls.iter().find(|t| t.matches(name)).cloned()) else { return };
     if ctx
         .registry
         .get(ctx.index, &app.name, name)

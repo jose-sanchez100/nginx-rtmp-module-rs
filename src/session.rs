@@ -3,7 +3,8 @@
 //! Combines the roles of `ngx_rtmp_init.c` (session setup / teardown),
 //! `ngx_rtmp_handler.c` (receive loop, ping, ack), `ngx_rtmp_receive.c`
 //! (protocol control messages), `ngx_rtmp_cmd_module.c` (NetConnection /
-//! NetStream commands) and `ngx_rtmp_access_module.c` (allow/deny).
+//! NetStream commands), `ngx_rtmp_access_module.c` (allow/deny) and the
+//! session side of `ngx_rtmp_notify_module.c` (HTTP callbacks).
 //!
 //! Each session runs a reader loop and a separate writer task fed by a
 //! bounded channel; the channel bound is the `out_queue` setting.
@@ -11,14 +12,15 @@
 use crate::amf::{self, Amf0};
 use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
-use crate::config::{AccessAction, AccessScope, AppConf, ServerConf};
+use crate::config::{AccessAction, AccessScope, AppConf, RelayTarget, ServerConf};
 use crate::handshake;
 use crate::live::{LiveError, Peer, Registry, SessionId, StreamRef};
 use crate::message::{self as msg, *};
+use crate::notify::{self, Form, Reply};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
@@ -83,6 +85,23 @@ struct Joined {
     _push_stop: Option<tokio::sync::watch::Sender<()>>,
 }
 
+/// Per-session notify state (`ngx_rtmp_notify_ctx_t`), shared with the
+/// `on_update` task.
+#[derive(Default)]
+struct NotifyCtx {
+    publishing: bool,
+    playing: bool,
+    /// Stream name and arguments as requested by the client (before any
+    /// redirect), reported by the `*_done` and `update` callbacks.
+    name: String,
+    args: String,
+}
+
+struct NotifyState {
+    ctx: Arc<Mutex<NotifyCtx>>,
+    update: Option<tokio::task::JoinHandle<()>>,
+}
+
 struct Session {
     id: SessionId,
     addr: SocketAddr,
@@ -96,6 +115,10 @@ struct Session {
     args: String,
     tc_url: String,
     flashver: String,
+    swf_url: String,
+    page_url: String,
+    /// A `connect` command was received (gates `on_disconnect`).
+    connect_seen: bool,
 
     ack_size: u32,
     in_bytes: u32,
@@ -104,6 +127,9 @@ struct Session {
 
     joined: Option<Joined>,
     last_av: Instant,
+    /// Timestamp of the last received message (`s->current_time`).
+    last_ts: Arc<AtomicU32>,
+    notify: Option<NotifyState>,
 }
 
 /// Run a session on an accepted connection until it closes.
@@ -151,16 +177,23 @@ where
         args: String::new(),
         tc_url: String::new(),
         flashver: String::new(),
+        swf_url: String::new(),
+        page_url: String::new(),
+        connect_seen: false,
         ack_size: 0,
         in_bytes: 0,
         in_last_ack: 0,
         buflen: conf.buflen.as_millis() as u32,
         joined: None,
         last_av: Instant::now(),
+        last_ts: Arc::new(AtomicU32::new(0)),
+        notify: None,
     };
 
     let result = s.read_loop(&mut rd).await;
     s.leave_stream();
+    s.notify_done();
+    s.notify_disconnect();
     let Session { peer, .. } = s;
     drop(peer); // closes the channel; writer flushes what is queued and exits
     let _ = tokio::time::timeout(conf.timeout, writer).await;
@@ -272,7 +305,7 @@ impl Session {
                     got_data = true;
                     self.account_in(n)?;
                     while let Some(m) = self.decoder.decode(&mut buf)? {
-                        if let Flow::Close = self.handle(m)? {
+                        if let Flow::Close = self.handle(m).await? {
                             return Ok(());
                         }
                     }
@@ -302,11 +335,12 @@ impl Session {
     // Message dispatch (ngx_rtmp_receive_message)
     // -----------------------------------------------------------------
 
-    fn handle(&mut self, m: Message) -> Result<Flow> {
+    async fn handle(&mut self, m: Message) -> Result<Flow> {
         debug!(
             "recv {} ({}) csid={} msid={} ts={} len={}",
             type_name(m.type_id), m.type_id, m.csid, m.msid, m.timestamp, m.payload.len()
         );
+        self.last_ts.store(m.timestamp, Ordering::Relaxed);
         match m.type_id {
             MSG_CHUNK_SIZE => {
                 let v = be_u32(&m.payload)? & 0x7fff_ffff;
@@ -321,8 +355,8 @@ impl Session {
             MSG_AUDIO | MSG_VIDEO => self.handle_av(m.type_id, m.timestamp, m.payload),
             MSG_AMF_META => return self.handle_data(&m.payload),
             MSG_AMF3_META => return self.handle_data(m.payload.get(1..).unwrap_or_default()),
-            MSG_AMF_CMD => return self.handle_cmd(&m.payload),
-            MSG_AMF3_CMD => return self.handle_cmd(m.payload.get(1..).unwrap_or_default()),
+            MSG_AMF_CMD => return self.handle_cmd(&m.payload).await,
+            MSG_AMF3_CMD => return self.handle_cmd(m.payload.get(1..).unwrap_or_default()).await,
             MSG_AGGREGATE => return self.handle_aggregate(m),
             MSG_AMF_SHARED | MSG_AMF3_SHARED | MSG_EDGE => {}
             t => debug!("unhandled message type {t}"),
@@ -351,9 +385,23 @@ impl Session {
     }
 
     /// Aggregate message: a sequence of FLV tags (`ngx_rtmp_aggregate_message_handler`).
+    /// FLV tags only carry audio, video and metadata.
     fn handle_aggregate(&mut self, m: Message) -> Result<Flow> {
         for sub in msg::split_aggregate(&m) {
-            if let Flow::Close = self.handle(sub)? {
+            self.last_ts.store(sub.timestamp, Ordering::Relaxed);
+            let flow = match sub.type_id {
+                MSG_AUDIO | MSG_VIDEO => {
+                    self.handle_av(sub.type_id, sub.timestamp, sub.payload);
+                    Flow::Continue
+                }
+                MSG_AMF_META => self.handle_data(&sub.payload)?,
+                MSG_AMF3_META => self.handle_data(sub.payload.get(1..).unwrap_or_default())?,
+                t => {
+                    debug!("unexpected message type {t} in aggregate");
+                    Flow::Continue
+                }
+            };
+            if let Flow::Close = flow {
                 return Ok(Flow::Close);
             }
         }
@@ -394,7 +442,7 @@ impl Session {
     // Commands (ngx_rtmp_cmd_module.c)
     // -----------------------------------------------------------------
 
-    fn handle_cmd(&mut self, payload: &[u8]) -> Result<Flow> {
+    async fn handle_cmd(&mut self, payload: &[u8]) -> Result<Flow> {
         let v = amf::decode_all(payload)
             .map_err(|e| SessionError::Protocol(format!("bad AMF command: {e}")))?;
         let Some(name) = v.first().and_then(Amf0::as_str) else {
@@ -405,7 +453,7 @@ impl Session {
         let str_arg = |i: usize| v.get(i).and_then(Amf0::as_str).unwrap_or("").to_string();
 
         match name {
-            "connect" => self.cmd_connect(tid, v.get(2)),
+            "connect" => self.cmd_connect(tid, v.get(2)).await,
             "createStream" => {
                 self.require_connected()?;
                 self.send(amf_cmd(
@@ -417,7 +465,7 @@ impl Session {
             }
             "publish" => {
                 self.require_connected()?;
-                self.cmd_publish(&str_arg(3), &str_arg(4))
+                self.cmd_publish(&str_arg(3), &str_arg(4)).await
             }
             "play" | "play2" => {
                 self.require_connected()?;
@@ -426,7 +474,7 @@ impl Session {
                 } else {
                     str_arg(3)
                 };
-                self.cmd_play(&name)
+                self.cmd_play(&name).await
             }
             "closeStream" | "deleteStream" => {
                 self.cmd_close_stream()?;
@@ -451,10 +499,11 @@ impl Session {
         if self.connected { Ok(()) } else { Err(SessionError::Protocol("command before connect".into())) }
     }
 
-    fn cmd_connect(&mut self, tid: f64, obj: Option<&Amf0>) -> Result<Flow> {
-        if self.connected {
+    async fn cmd_connect(&mut self, tid: f64, obj: Option<&Amf0>) -> Result<Flow> {
+        if self.connected || self.connect_seen {
             return Err(SessionError::Protocol("duplicate connection".into()));
         }
+        self.connect_seen = true;
         let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(Amf0::as_str).unwrap_or("").to_string();
         let mut app = get("app");
         if let Some((a, args)) = app.split_once('?') {
@@ -463,12 +512,40 @@ impl Session {
         }
         self.tc_url = get("tcUrl");
         self.flashver = get("flashVer");
+        self.swf_url = get("swfUrl");
+        self.page_url = get("pageUrl");
         let object_encoding = obj.and_then(|o| o.get("objectEncoding")).and_then(Amf0::as_f64).unwrap_or(0.0);
 
         info!(
             "connect: app='{app}' args='{}' flashver='{}' tc_url='{}'",
             self.args, self.flashver, self.tc_url
         );
+
+        // on_connect (ngx_rtmp_notify_connect)
+        if let Some(url) = self.ctx.conf.notify.on_connect.clone() {
+            info!("notify: connect '{}'", url.raw);
+            let mut f = Form::new();
+            f.add("app", &app)
+                .add("flashver", &self.flashver)
+                .add("swfurl", &self.swf_url)
+                .add("tcurl", &self.tc_url)
+                .add("pageurl", &self.page_url)
+                .add("addr", self.addr.ip().to_string())
+                .add("epoch", epoch_ms().to_string())
+                .add("call", "connect")
+                .raw(&self.args);
+            match notify::call(&url, self.ctx.conf.notify.method, &f, self.ctx.conf.netcall_timeout).await {
+                Reply::Ok | Reply::Redirect(None) => {}
+                Reply::Redirect(Some(loc)) => {
+                    info!("notify: connect redirect to '{loc}'");
+                    app = loc;
+                }
+                Reply::Error(e) => {
+                    info!("notify: connect rejected: {e}");
+                    return Ok(Flow::Close);
+                }
+            }
+        }
 
         let Some(conf) = self.ctx.apps.iter().find(|a| a.name == app).cloned() else {
             info!("connect: application not found: '{app}'");
@@ -521,14 +598,34 @@ impl Session {
         true
     }
 
-    fn cmd_publish(&mut self, name: &str, kind: &str) -> Result<Flow> {
-        let name = name.split_once('?').map_or(name, |(n, _)| n).to_string();
-        info!("publish: name='{name}' type='{kind}'");
+    async fn cmd_publish(&mut self, full_name: &str, kind: &str) -> Result<Flow> {
+        let (name, args) = full_name.split_once('?').unwrap_or((full_name, ""));
+        let mut name = name.to_string();
+        info!("publish: name='{name}' args='{args}' type='{kind}'");
         if !self.access_allowed(true) {
             info!("access forbidden: publish");
             return Ok(Flow::Close);
         }
         let app = self.app.clone().expect("connected");
+
+        // on_publish (ngx_rtmp_notify_publish)
+        let mut redirect_push = None;
+        self.notify_init(&name, args, true);
+        if let Some(url) = app.notify.on_publish.clone() {
+            info!("notify: publish '{}'", url.raw);
+            let mut f = self.notify_form();
+            f.add("call", "publish").add("name", &name).add("type", kind).raw(args);
+            match self.notify_redirect(&app, &url, &f, "publish", &mut name).await {
+                Some(target) => redirect_push = target,
+                None => {
+                    if let Some(n) = &self.notify {
+                        n.ctx.lock().unwrap().publishing = false;
+                    }
+                    return Ok(Flow::Close);
+                }
+            }
+        }
+
         if !app.live {
             warn!("publish: 'live' is off in application '{}', stream goes nowhere", app.name);
             return Ok(Flow::Continue);
@@ -536,7 +633,7 @@ impl Session {
         self.leave_stream();
         match self.ctx.registry.publish(self.ctx.index, &app, &name, &self.peer) {
             Ok(stream) => {
-                let push_stop = crate::relay::start_pushes(&self.ctx, &app, &name);
+                let push_stop = crate::relay::start_pushes(&self.ctx, &app, &name, redirect_push);
                 self.joined = Some(Joined { name, publishing: true, stream, _push_stop: push_stop });
                 self.last_av = Instant::now();
                 self.send(msg::status("NetStream.Publish.Start", "status", "Start publishing"))?;
@@ -551,14 +648,41 @@ impl Session {
         }
     }
 
-    fn cmd_play(&mut self, name: &str) -> Result<Flow> {
-        let name = name.split_once('?').map_or(name, |(n, _)| n).to_string();
-        info!("play: name='{name}'");
+    async fn cmd_play(&mut self, full_name: &str) -> Result<Flow> {
+        let (name, args) = full_name.split_once('?').unwrap_or((full_name, ""));
+        let mut name = name.to_string();
+        info!("play: name='{name}' args='{args}'");
         if !self.access_allowed(false) {
             info!("access forbidden: play");
             return Ok(Flow::Close);
         }
         let app = self.app.clone().expect("connected");
+
+        // on_play (ngx_rtmp_notify_play)
+        let mut redirect_pull = None;
+        self.notify_init(&name, args, false);
+        if let Some(url) = app.notify.on_play.clone() {
+            info!("notify: play '{}'", url.raw);
+            let mut f = self.notify_form();
+            // start/duration/reset are not tracked; live clients leave them
+            // at their defaults.
+            f.add("call", "play")
+                .add("name", &name)
+                .add("start", "0")
+                .add("duration", "0")
+                .add("reset", "0")
+                .raw(args);
+            match self.notify_redirect(&app, &url, &f, "play", &mut name).await {
+                Some(target) => redirect_pull = target,
+                None => {
+                    if let Some(n) = &self.notify {
+                        n.ctx.lock().unwrap().playing = false;
+                    }
+                    return Ok(Flow::Close);
+                }
+            }
+        }
+
         if !app.live {
             warn!("play: 'live' is off in application '{}' (VOD not ported yet)", app.name);
             self.send(msg::status("NetStream.Play.StreamNotFound", "error", "No such stream"))?;
@@ -567,7 +691,7 @@ impl Session {
         self.leave_stream();
         // ngx_rtmp_cmd_stream_begin / ngx_rtmp_live_play
         self.send(msg::stream_begin(MSID))?;
-        crate::relay::maybe_pull(&self.ctx, &app, &name);
+        crate::relay::maybe_pull(&self.ctx, &app, &name, redirect_pull);
         match self.ctx.registry.play(self.ctx.index, &app, &name, &self.peer) {
             Ok(stream) => {
                 if !app.play_restart {
@@ -586,6 +710,7 @@ impl Session {
     }
 
     fn cmd_close_stream(&mut self) -> Result<()> {
+        self.notify_done();
         let Some(j) = &self.joined else { return Ok(()) };
         let publishing = j.publishing;
         let play_restart = self.app.as_ref().is_some_and(|a| a.play_restart);
@@ -610,6 +735,189 @@ impl Session {
             self.send(msg::status("NetStream.Unpause.Notify", "status", "Unpaused live"))?;
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Notify (ngx_rtmp_notify_module.c)
+    // -----------------------------------------------------------------
+
+    /// Common callback parameters (`ngx_rtmp_netcall_http_format_session`).
+    fn notify_form(&self) -> Form {
+        let mut f = Form::new();
+        f.add("app", &self.app_name)
+            .add("flashver", &self.flashver)
+            .add("swfurl", &self.swf_url)
+            .add("tcurl", &self.tc_url)
+            .add("pageurl", &self.page_url)
+            .add("addr", self.addr.ip().to_string())
+            .add("clientid", self.id.to_string());
+        f
+    }
+
+    /// `ngx_rtmp_notify_init`: remember the stream for the `*_done` and
+    /// `update` callbacks and start the `on_update` timer.
+    fn notify_init(&mut self, name: &str, args: &str, publishing: bool) {
+        let app = self.app.clone().expect("connected");
+        let nc = &app.notify;
+        if !nc.active() {
+            return;
+        }
+        let base = self.notify_form();
+        let state = self.notify.get_or_insert_with(|| NotifyState { ctx: Default::default(), update: None });
+        {
+            let mut c = state.ctx.lock().unwrap();
+            c.name = name.to_string();
+            c.args = args.to_string();
+            if publishing {
+                c.publishing = true;
+            } else {
+                c.playing = true;
+            }
+        }
+        let Some(url) = nc.on_update.clone() else { return };
+        if nc.update_timeout.is_zero() || state.update.is_some() {
+            return;
+        }
+        let ctx = state.ctx.clone();
+        let last_ts = self.last_ts.clone();
+        let close = self.peer.close.clone();
+        let (method, period, strict, timeout) =
+            (nc.method, nc.update_timeout, nc.update_strict, self.ctx.conf.netcall_timeout);
+        let task = async move {
+            let start = Instant::now();
+            loop {
+                tokio::time::sleep(period).await;
+                let mut f = base.clone();
+                {
+                    let c = ctx.lock().unwrap();
+                    let call = if c.publishing {
+                        "update_publish"
+                    } else if c.playing {
+                        "update_play"
+                    } else {
+                        "update"
+                    };
+                    f.add("call", call)
+                        .add("time", start.elapsed().as_secs().to_string())
+                        .add("timestamp", last_ts.load(Ordering::Relaxed).to_string());
+                    if !c.name.is_empty() {
+                        f.add("name", &c.name);
+                    }
+                    f.raw(&c.args);
+                }
+                info!("notify: update '{}'", url.raw);
+                let reply = notify::call(&url, method, &f, timeout).await;
+                let failed = match &reply {
+                    Reply::Ok => false,
+                    Reply::Redirect(_) => strict,
+                    Reply::Error(_) => true,
+                };
+                if failed {
+                    info!("notify: update failed: {reply:?}");
+                    close.notify_one();
+                    return;
+                }
+            }
+        };
+        state.update = Some(tokio::spawn(task.in_current_span()));
+    }
+
+    /// Send an `on_publish` / `on_play` callback and apply its answer.
+    /// Returns `None` to reject, or `Some(target)` to go on, where `target`
+    /// is set for a redirect to an `rtmp://` URL (push / pull). A plain 3xx
+    /// redirect renames the stream in `name`.
+    async fn notify_redirect(
+        &self,
+        app: &AppConf,
+        url: &notify::NotifyUrl,
+        form: &Form,
+        what: &str,
+        name: &mut String,
+    ) -> Option<Option<Arc<RelayTarget>>> {
+        match notify::call(url, app.notify.method, form, self.ctx.conf.netcall_timeout).await {
+            Reply::Ok | Reply::Redirect(None) => Some(None),
+            Reply::Redirect(Some(loc)) => {
+                if loc.len() < 7 || !loc[..7].eq_ignore_ascii_case("rtmp://") {
+                    info!("notify: {what} redirect to '{loc}'");
+                    *name = loc;
+                    return Some(None);
+                }
+                if app.notify.relay_redirect {
+                    *name = notify::relay_redirect_name(&loc);
+                }
+                let Some(t) = RelayTarget::parse_url(&loc) else {
+                    info!("notify: {what} relay failed '{name}': bad url '{loc}'");
+                    return None;
+                };
+                let relay = if what == "publish" { "push to" } else { "pull from" };
+                info!("notify: {what} '{name}' {relay} '{loc}'");
+                Some(Some(Arc::new(t)))
+            }
+            Reply::Error(e) => {
+                info!("notify: {what} rejected: {e}");
+                None
+            }
+        }
+    }
+
+    /// `ngx_rtmp_notify_close_stream`: fire `on_publish_done` /
+    /// `on_play_done` / `on_done` (without waiting) and stop `on_update`.
+    fn notify_done(&mut self) {
+        let Some(state) = &mut self.notify else { return };
+        if let Some(t) = state.update.take() {
+            t.abort();
+        }
+        let (publishing, playing, name, args) = {
+            let mut c = state.ctx.lock().unwrap();
+            let r = (c.publishing, c.playing, c.name.clone(), c.args.clone());
+            c.publishing = false;
+            c.playing = false;
+            r
+        };
+        let Some(app) = self.app.clone() else { return };
+        let nc = &app.notify;
+        let calls = [
+            (publishing, "publish_done", &nc.on_publish_done),
+            (playing, "play_done", &nc.on_play_done),
+            (publishing || playing, "done", &nc.on_done),
+        ];
+        for (on, call, url) in calls {
+            let (true, Some(url)) = (on, url.clone()) else { continue };
+            info!("notify: {call} '{}'", url.raw);
+            let mut f = self.notify_form();
+            f.add("call", call);
+            if !name.is_empty() {
+                f.add("name", &name);
+            }
+            f.raw(&args);
+            let (method, timeout) = (nc.method, self.ctx.conf.netcall_timeout);
+            tokio::spawn(
+                async move {
+                    if let Reply::Error(e) = notify::call(&url, method, &f, timeout).await {
+                        debug!("notify: {call} failed: {e}");
+                    }
+                }
+                .in_current_span(),
+            );
+        }
+    }
+
+    /// `ngx_rtmp_notify_disconnect` (fire and forget).
+    fn notify_disconnect(&self) {
+        let nc = &self.ctx.conf.notify;
+        let (true, Some(url)) = (self.connect_seen, nc.on_disconnect.clone()) else { return };
+        info!("notify: disconnect '{}'", url.raw);
+        let mut f = self.notify_form();
+        f.add("call", "disconnect").raw(&self.args);
+        let (method, timeout) = (nc.method, self.ctx.conf.netcall_timeout);
+        tokio::spawn(
+            async move {
+                if let Reply::Error(e) = notify::call(&url, method, &f, timeout).await {
+                    debug!("notify: disconnect failed: {e}");
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     fn leave_stream(&mut self) {

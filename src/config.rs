@@ -9,6 +9,7 @@
 //! directives written in `rtmp {}` / `server {}` are defaults for every
 //! `application {}`. Unsupported directives are logged and ignored.
 
+use crate::notify::{AppNotify, Method, NotifyUrl, SrvNotify};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -263,6 +264,8 @@ pub struct AppConf {
     pub pull_reconnect: Duration,
     /// `relay_buffer`: buffer length announced to the upstream on pull.
     pub relay_buffer: Duration,
+    // notify module
+    pub notify: AppNotify,
 }
 
 impl Default for AppConf {
@@ -286,6 +289,7 @@ impl Default for AppConf {
             push_reconnect: Duration::from_secs(3),
             pull_reconnect: Duration::from_secs(3),
             relay_buffer: Duration::from_secs(5),
+            notify: AppNotify::new(),
         }
     }
 }
@@ -307,6 +311,10 @@ pub struct ServerConf {
     pub busy: bool,
     pub buflen: Duration,
     pub so_keepalive: bool,
+    /// `on_connect` / `on_disconnect`.
+    pub notify: SrvNotify,
+    /// `netcall_timeout`: limit for each HTTP callback.
+    pub netcall_timeout: Duration,
     pub applications: Vec<AppConf>,
 }
 
@@ -328,6 +336,8 @@ impl Default for ServerConf {
             busy: false,
             buflen: Duration::from_secs(1),
             so_keepalive: false,
+            notify: SrvNotify::default(),
+            netcall_timeout: Duration::from_secs(10),
             applications: Vec::new(),
         }
     }
@@ -447,6 +457,19 @@ impl Cx<'_> {
         srv: Option<&mut ServerConf>,
         app: &mut AppConf,
     ) -> Result<(), ConfigError> {
+        if d.name == "notify_method" {
+            // Applies to both the app callbacks and on_connect/on_disconnect.
+            let m = match self.one(d)?.to_ascii_lowercase().as_str() {
+                "get" => Method::Get,
+                "post" => Method::Post,
+                _ => return Err(self.err(d.line, "got unexpected method in \"notify_method\"")),
+            };
+            app.notify.method = m;
+            if let Some(srv) = srv {
+                srv.notify.method = m;
+            }
+            return Ok(());
+        }
         if let Some(srv) = srv
             && self.apply_srv(d, srv)? {
                 return Ok(());
@@ -493,6 +516,12 @@ impl Cx<'_> {
             "busy" => s.busy = self.flag(d)?,
             "buflen" => s.buflen = self.time(d)?,
             "so_keepalive" => s.so_keepalive = self.flag(d)?,
+            "on_connect" => s.notify.on_connect = Some(self.notify_url(d)?),
+            "on_disconnect" => s.notify.on_disconnect = Some(self.notify_url(d)?),
+            "netcall_timeout" => s.netcall_timeout = self.time(d)?,
+            "netcall_buffer" => {
+                self.size(d)?;
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -533,9 +562,26 @@ impl Cx<'_> {
             "session_relay" => {
                 self.flag(d)?;
             }
+            "on_play" => a.notify.on_play = Some(self.notify_url(d)?),
+            "on_publish" => a.notify.on_publish = Some(self.notify_url(d)?),
+            "on_play_done" => a.notify.on_play_done = Some(self.notify_url(d)?),
+            "on_publish_done" => a.notify.on_publish_done = Some(self.notify_url(d)?),
+            "on_done" => a.notify.on_done = Some(self.notify_url(d)?),
+            "on_record_done" => a.notify.on_record_done = Some(self.notify_url(d)?),
+            "on_update" => a.notify.on_update = Some(self.notify_url(d)?),
+            "notify_update_timeout" => a.notify.update_timeout = self.time(d)?,
+            "notify_update_strict" => a.notify.update_strict = self.flag(d)?,
+            "notify_relay_redirect" => a.notify.relay_redirect = self.flag(d)?,
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    fn notify_url(&self, d: &Directive) -> Result<Arc<NotifyUrl>, ConfigError> {
+        let v = self.one(d)?;
+        NotifyUrl::parse(v)
+            .map(Arc::new)
+            .ok_or_else(|| self.err(d.line, format!("invalid url \"{v}\" in \"{}\"", d.name)))
     }
 
     fn relay_target(&self, d: &Directive) -> Result<RelayTarget, ConfigError> {
