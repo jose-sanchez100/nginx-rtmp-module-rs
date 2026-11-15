@@ -136,9 +136,12 @@ elsewhere), so an existing `stop.bat` keeps working.
 
 ### Configuration editor (not in nginx)
 
-`nginx -e`, or "Configure…" in the tray menu, opens `nginx.conf` in the browser
-(`src/editor.rs`, `src/editor.html`), served on 127.0.0.1 with a random token in the
-URL:
+`nginx -e`, or "Configure…" in the tray menu, opens `nginx.conf` in a window of the
+application (`src/editor_window.rs`: the page in a WebView2 control, with the browser as
+the fallback when the WebView2 runtime is missing and on other systems). The page
+(`src/editor.rs`, `src/editor.html`) is served on 127.0.0.1 with a random token in the
+URL. Closing the window with unsaved changes asks first; with `-e` the program ends when
+the window is closed. WebView2 keeps its data in `%LOCALAPPDATA%\nginx-rtmp-module-rs`.
 
 - A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
   `location`) and, for the selected one, a form with every directive: on/off

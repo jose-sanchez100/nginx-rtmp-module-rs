@@ -1,5 +1,7 @@
 mod daemon;
 #[cfg(windows)]
+mod editor_window;
+#[cfg(windows)]
 mod tray;
 
 use nginx_rtmp::access_log::resolve_path;
@@ -26,7 +28,7 @@ const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-e] [-s stop
             default: PREFIX/conf/nginx.conf, or conf/nginx.conf in the
             working directory when -p is not given and that file is missing
   -t        test configuration and exit
-  -e        edit the configuration in the browser; saving reloads the
+  -e        edit the configuration in a window; saving reloads the
             running server (the tray icon's Configure does the same)
   -s SIGNAL send a signal to the running server: stop, quit, reload
 
@@ -266,17 +268,32 @@ async fn reload_config(reloader: &Reloader, conf_path: &Path, prefix: &Path, log
     Ok("The running server uses the new configuration.".into())
 }
 
-/// Start the editor once and open it in the browser.
+/// Start the editor once and show it in its window (in the browser where
+/// there is no window).
 async fn open_editor(editor: &mut Option<editor::Running>, conf_path: &Path, apply: editor::Apply) -> Result<(), String> {
     if editor.is_none() {
         let e = editor::start(conf_path.to_path_buf(), 0, apply).await.map_err(|e| format!("editor: {e}"))?;
         *editor = Some(e);
     }
-    let url = &editor.as_ref().expect("started above").url;
-    if !daemon::open_browser(url) {
-        return Err(format!("open {url} in a browser"));
+    let url = editor.as_ref().expect("started above").url.clone();
+    show_editor(&url).await.map(drop)
+}
+
+/// The editor's window thread, `None` when an open window was brought to
+/// the front or the page went to the browser.
+type Shown = Option<std::thread::JoinHandle<()>>;
+
+async fn show_editor(url: &str) -> Result<Shown, String> {
+    #[cfg(windows)]
+    {
+        let u = url.to_string();
+        match tokio::task::spawn_blocking(move || editor_window::open(&u)).await {
+            Ok(Ok(shown)) => return Ok(shown),
+            Ok(Err(e)) => tracing::warn!("editor window: {e}; using the browser"),
+            Err(e) => tracing::warn!("editor window: {e}; using the browser"),
+        }
     }
-    Ok(())
+    if daemon::open_browser(url) { Ok(None) } else { Err(format!("open {url} in a browser")) }
 }
 
 /// `-e`: edit the configuration without starting a server; saving sends
@@ -304,8 +321,18 @@ async fn edit_standalone(prefix: PathBuf, conf_path: PathBuf) -> ExitCode {
         }
     };
     println!("nginx: editing {}", conf_path.display());
-    println!("nginx: open {} (Ctrl+C to quit)", running.url);
-    daemon::open_browser(&running.url);
-    let _ = tokio::signal::ctrl_c().await;
+    match show_editor(&running.url).await {
+        // Done when the window is closed.
+        Ok(Some(window)) => {
+            tokio::select! {
+                _ = tokio::task::spawn_blocking(move || window.join()) => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        _ => {
+            println!("nginx: open {} (Ctrl+C to quit)", running.url);
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
     ExitCode::SUCCESS
 }

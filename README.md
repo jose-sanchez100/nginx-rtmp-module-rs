@@ -22,7 +22,7 @@ This is not an nginx module and does not need nginx: it runs on
 - RTMPS, which nginx-rtmp lacks: `rtmps://` relays (e.g. Facebook, YouTube) and
   `listen PORT ssl;`.
 - Enhanced RTMP codecs (HEVC, AV1, VP9) are forwarded.
-- Configuration editor in the browser (`nginx -e` or the tray menu) with a form for
+- Configuration editor in its own window (`nginx -e` or the tray menu) with a form for
   every supported directive; saving reloads the running server without dropping
   connections (`-s reload` works too).
 - On Windows: runs without a console like nginx, error log, pid file,
@@ -46,7 +46,8 @@ The binary is `target/release/nginx` (`nginx.exe` on Windows).
 nginx [-p prefix] [-c nginx.conf] [-t] [-e] [-s stop|quit|reload]
 ```
 
-`-e` opens the configuration editor in the browser; `-s reload` applies a changed
+`-e` opens the configuration editor in a window (WebView2; the browser where it is
+not available); `-s reload` applies a changed
 `nginx.conf` to the running server, keeping current connections.
 
 The prefix defaults to the executable's directory and the configuration to

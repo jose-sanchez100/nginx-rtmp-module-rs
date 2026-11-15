@@ -20,8 +20,10 @@
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, "Segoe UI", sans-serif; }
-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
+/* Laid out like an application: the tree and the form scroll on their own. */
+html, body { height: 100%; }
+body { margin: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex: none; flex-wrap: wrap; }
 header h1 { font-size: 16px; margin: 0; }
 header .path { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 120px; }
 .dirty::after { content: " ●"; color: var(--warn); }
@@ -35,13 +37,13 @@ button:disabled { opacity: .5; cursor: default; }
 .tabs { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .tabs button { border: 0; border-radius: 0; }
 .tabs button.on { background: var(--sel); font-weight: 600; }
-main { display: grid; grid-template-columns: 260px 1fr; gap: 0; min-height: calc(100vh - 100px); }
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px 1fr; gap: 0; }
 nav { border-right: 1px solid var(--line); padding: 8px 0; background: var(--panel); overflow: auto; }
 nav .node { padding: 4px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid transparent; }
 nav .node:hover { background: var(--hover); }
 nav .node.sel { background: var(--sel); border-left-color: var(--accent); font-weight: 600; }
 nav .node .kind { color: var(--muted); font-weight: normal; }
-section#pane { padding: 16px 20px 80px; overflow: auto; }
+section#pane { padding: 16px 20px 24px; overflow: auto; }
 .crumbs { color: var(--muted); margin-bottom: 4px; font-size: 12px; }
 h2 { margin: 0 0 4px; font-size: 18px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .help { color: var(--muted); margin: 0 0 12px; }
@@ -70,15 +72,16 @@ h2 { margin: 0 0 4px; font-size: 18px; display: flex; gap: 8px; align-items: cen
 .add { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .add select { background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; max-width: 360px; }
 .add .addhelp { color: var(--muted); flex-basis: 100%; }
-textarea#text { width: 100%; height: calc(100vh - 180px); font: 13px/1.45 ui-monospace, Consolas, monospace; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; tab-size: 4; }
-footer { position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 16px; font-size: 13px; max-height: 30vh; overflow: auto; }
+#text-view { flex: 1; min-height: 0; padding: 12px 16px; box-sizing: border-box; }
+textarea#text { box-sizing: border-box; width: 100%; height: 100%; resize: none; font: 13px/1.45 ui-monospace, Consolas, monospace; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; tab-size: 4; }
+footer { flex: none; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 16px; font-size: 13px; max-height: 30vh; overflow: auto; }
 footer .msg { padding: 3px 8px; border-radius: 5px; margin: 2px 0; white-space: pre-wrap; }
 footer .msg.err { background: var(--err-bg); color: var(--err); }
 footer .msg.warn { background: var(--warn-bg); color: var(--warn); }
 footer .msg.ok { background: var(--ok-bg); }
 .hidden { display: none !important; }
 @media (max-width: 760px) {
-  main { grid-template-columns: 1fr; }
+  main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   nav { border-right: 0; border-bottom: 1px solid var(--line); max-height: 30vh; }
   .row { grid-template-columns: 1fr; }
 }
@@ -97,7 +100,7 @@ footer .msg.ok { background: var(--ok-bg); }
   <nav id="tree"></nav>
   <section id="pane"></section>
 </main>
-<div id="text-view" class="hidden" style="padding:12px 16px 80px"><textarea id="text" spellcheck="false"></textarea></div>
+<div id="text-view" class="hidden"><textarea id="text" spellcheck="false"></textarea></div>
 <footer id="status"></footer>
 <script>
 "use strict";
@@ -406,7 +409,7 @@ function showCheck(c, extra) {
 }
 let checkTimer = null;
 function changed() {
-  dirty = true; $("#title").classList.add("dirty");
+  setDirty(true);
   clearTimeout(checkTimer);
   checkTimer = setTimeout(async () => { const r = await api("render", { tree }); if (r.check) { lastCheck = r.check; showCheck(r.check); } }, 400);
 }
@@ -417,7 +420,7 @@ async function load() {
   const r = await api("load");
   if (r.error) { status([["err", r.error]]); return; }
   $("#path").textContent = r.path; document.title = "nginx.conf editor — " + r.path;
-  hash = r.hash; dirty = false; $("#title").classList.remove("dirty");
+  hash = r.hash; setDirty(false);
   $("#text").value = r.text;
   if (r.parse_error) { setMode("text", true); status([["err", "The file cannot be shown as a form: " + r.parse_error]]); return; }
   tree = r.tree; lastCheck = r.check;
@@ -456,7 +459,13 @@ async function save(force) {
 
 $("#tab-form").onclick = () => setMode("form");
 $("#tab-text").onclick = () => setMode("text");
-$("#text").addEventListener("input", () => { dirty = true; $("#title").classList.add("dirty"); });
+$("#text").addEventListener("input", () => setDirty(true));
+// In the app window (WebView2) the window asks before closing with unsaved changes.
+function setDirty(v) {
+  dirty = v;
+  $("#title").classList.toggle("dirty", v);
+  if (window.ipc) window.ipc.postMessage(v ? "dirty" : "clean");
+}
 $("#text").addEventListener("keydown", (e) => {
   if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("    ", s, t.selectionEnd, "end"); }
 });
