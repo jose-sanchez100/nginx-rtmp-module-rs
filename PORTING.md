@@ -36,11 +36,11 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_shared.c`, `ngx_rtmp_bandwidth.c` | — | not needed (`Bytes` is refcounted) / basic counters in `live::StreamStats` |
 | `ngx_rtmp_proxy_protocol.c` | — | ⬜ |
 | `ngx_rtmp_limit_module.c` | — | ⬜ `max_connections` |
-| `ngx_rtmp_record_module.c` + `ngx_rtmp_flv_module.c` | — | ⬜ FLV recording |
-| `ngx_rtmp_play_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
+| `ngx_rtmp_record_module.c` | `src/record.rs` | ✅ `record` (`all`, `audio`, `video`, `keyframes`, `manual`, `off`), `record_path`, `record_suffix` (with `strftime` patterns), `record_unique`, `record_append`, `record_lock`, `record_max_size`, `record_max_frames`, `record_interval`, `record_notify`, `recorder` blocks; pulled streams are recorded too. `manual` recorders need the control module (not ported) |
+| `ngx_rtmp_play_module.c`, `ngx_rtmp_flv_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
 | `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull` (also `rtmps://`, see below), `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
-| `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` is parsed but waits for `record` |
-| `ngx_rtmp_exec_module.c` | `src/exec.rs` | ✅ `exec`, `exec_push`, `exec_pull`, `exec_static`, `exec_publish`, `exec_publish_done`, `exec_play`, `exec_play_done`, `respawn`, `respawn_timeout`, `exec_kill_signal`, `exec_options` (`name=`); `$var` arguments and `>file` / `2>>file` / `2>&1` redirection. Works on Windows (the C module is compiled out there). `exec_record_done` is parsed but waits for `record` |
+| `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` |
+| `ngx_rtmp_exec_module.c` | `src/exec.rs` | ✅ `exec`, `exec_push`, `exec_pull`, `exec_static`, `exec_publish`, `exec_publish_done`, `exec_play`, `exec_play_done`, `respawn`, `respawn_timeout`, `exec_kill_signal`, `exec_options` (`name=`); `$var` arguments and `>file` / `2>>file` / `2>&1` redirection. Works on Windows (the C module is compiled out there). `exec_record_done` (with `$recorder`, `$path`, `$filename`, `$basename`, `$dirname`) |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
 | `ngx_rtmp_log_module.c` | `access_log.rs` | ✅ `access_log`, `log_format`, all variables |
 | `ngx_rtmp_stat_module.c`, `ngx_rtmp_control_module.c` | — | ⬜ need an HTTP endpoint of their own |
@@ -80,6 +80,13 @@ The port is a **standalone RTMP server** on `tokio`:
   Only file descriptors 0-2 can be redirected. On Windows a backslash in arguments is
   a path separator, not an escape (`C:\rec\$name.flv`). `name=` filters match any of
   the listed names (nginx compares only the first).
+- Record: files are opened after the publish succeeds (nginx opens them first, so a
+  rejected second publisher truncates the file being recorded). Relative
+  `record_path` values resolve against the prefix, an empty one means the prefix
+  itself (nginx would write to `/`), and missing directories are created. An AAC
+  sequence header is written once (nginx writes it twice at the start of a file).
+  The reported path uses the platform's separator before the file name
+  (`C:\rec\cam.flv`). `record_lock` does nothing on Windows, as in nginx.
 
 ## Running
 
@@ -165,5 +172,5 @@ ffplay rtmp://127.0.0.1/live/test
 ## Suggested next steps
 
 1. SPS/ASC parsing in `codec` → `hls`.
-2. `record` (FLV) — reuses the `live` flow as is; then wire `on_record_done`.
-3. `stat` / `control` (HTTP endpoint).
+2. `stat` / `control` (HTTP endpoint; `control` also drives `record manual`).
+3. VOD (`play` module: FLV / MP4 files).

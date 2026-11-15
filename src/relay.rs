@@ -510,13 +510,34 @@ async fn pull_once(
         .publish(ctx.index, app, name, &peer)
         .map_err(|e| RelayError::Local(e.to_string()))?;
 
-    let r = pull_pump(&mut c, app, &stream, is_static).await;
+    // Pulled streams are recorded too (nginx's relay session goes through
+    // ngx_rtmp_publish). There is no client: only $app and $name are known.
+    let mut form = crate::notify::Form::new();
+    form.add("app", &app.name);
+    let owner = crate::record::Owner {
+        peer: None,
+        vars: vec![("app", app.name.clone())],
+        form,
+        args: String::new(),
+        exec: ctx.exec.clone(),
+        netcall_timeout: conf.netcall_timeout,
+    };
+    let mut rec = crate::record::Recording::start(&app.recorders, ctx.exec.prefix.as_deref(), name, owner);
+
+    let r = pull_pump(&mut c, app, &stream, is_static, &mut rec).await;
+    drop(rec);
     drop(stream);
     ctx.registry.leave(ctx.index, &app.name, name, id);
     r
 }
 
-async fn pull_pump(c: &mut Conn, app: &AppConf, stream: &StreamRef, is_static: bool) -> Result<()> {
+async fn pull_pump(
+    c: &mut Conn,
+    app: &AppConf,
+    stream: &StreamRef,
+    is_static: bool,
+    rec: &mut Option<crate::record::Recording>,
+) -> Result<()> {
     let mut check =
         tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     loop {
@@ -526,10 +547,10 @@ async fn pull_pump(c: &mut Conn, app: &AppConf, stream: &StreamRef, is_static: b
                 c.wr.send_replies(&mut c.rd).await?;
                 if m.type_id == MSG_AGGREGATE {
                     for sub in msg::split_aggregate(&m) {
-                        on_pulled(app, stream, sub)?;
+                        on_pulled(app, stream, rec, sub)?;
                     }
                 } else {
-                    on_pulled(app, stream, m)?;
+                    on_pulled(app, stream, rec, m)?;
                 }
             }
             _ = check.tick() => {
@@ -542,9 +563,14 @@ async fn pull_pump(c: &mut Conn, app: &AppConf, stream: &StreamRef, is_static: b
     }
 }
 
-fn on_pulled(app: &AppConf, stream: &StreamRef, m: Message) -> Result<()> {
+fn on_pulled(app: &AppConf, stream: &StreamRef, rec: &mut Option<crate::record::Recording>, m: Message) -> Result<()> {
     match m.type_id {
-        MSG_AUDIO | MSG_VIDEO => stream.lock().unwrap().on_av(m.type_id, m.timestamp, m.payload),
+        MSG_AUDIO | MSG_VIDEO => {
+            if let Some(r) = rec {
+                r.on_av(m.type_id, m.timestamp, &m.payload);
+            }
+            stream.lock().unwrap().on_av(m.type_id, m.timestamp, m.payload)
+        }
         MSG_AMF_META | MSG_AMF3_META => {
             let body = if m.type_id == MSG_AMF3_META { m.payload.get(1..).unwrap_or_default() } else { &m.payload[..] };
             if let Ok(v) = amf::decode_all(body)

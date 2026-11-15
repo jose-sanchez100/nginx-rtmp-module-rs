@@ -419,6 +419,38 @@ fn run_unmanaged(p: Prepared) {
     }
 }
 
+/// `exec_record_done` for one closed recording (`ngx_rtmp_exec_record_done`):
+/// adds `$recorder`, `$path`, `$filename`, `$basename` and `$dirname` to
+/// the session variables.
+#[allow(clippy::too_many_arguments)]
+pub fn record_done(
+    main: &MainExec,
+    list: &[Arc<ExecConf>],
+    mut vars: Vars,
+    name: &str,
+    args: &str,
+    recorder: &str,
+    path: &str,
+) {
+    let (dirname, filename) = match path.rfind(['/', '\\']) {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    };
+    let basename = filename.rfind('.').map_or(filename, |i| &filename[..i]);
+    vars.extend([
+        ("name", name.to_string()),
+        ("args", args.to_string()),
+        ("recorder", recorder.to_string()),
+        ("path", path.to_string()),
+        ("filename", filename.to_string()),
+        ("basename", basename.to_string()),
+        ("dirname", dirname.to_string()),
+    ]);
+    for c in list.iter().filter(|c| c.matches(name)) {
+        run_unmanaged(prepare(c, Some(&vars), main.prefix.as_deref()));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-stream and per-session state
 // ---------------------------------------------------------------------------

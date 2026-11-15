@@ -14,6 +14,7 @@ pub mod live;
 pub mod message;
 pub mod monitor;
 pub mod notify;
+pub mod record;
 pub mod relay;
 pub mod server;
 pub mod session;

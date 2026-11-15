@@ -142,6 +142,8 @@ struct Session {
     bytes_in: Arc<AtomicU64>,
     /// exec module children of this session.
     exec: crate::exec::SessionExec,
+    /// Files being recorded while publishing.
+    record: Option<crate::record::Recording>,
 }
 
 #[derive(Default)]
@@ -224,6 +226,7 @@ where
         log: LogCtx::default(),
         bytes_in,
         exec: Default::default(),
+        record: None,
     };
 
     let result = s.read_loop(&mut rd).await;
@@ -476,6 +479,9 @@ impl Session {
             return;
         }
         self.last_av = Instant::now();
+        if let Some(r) = &mut self.record {
+            r.on_av(type_id, ts, &payload);
+        }
         j.stream.lock().unwrap().on_av(type_id, ts, payload);
     }
 
@@ -706,6 +712,16 @@ impl Session {
                 let push_stop = crate::relay::start_pushes(&self.ctx, &app, &name, redirect_push);
                 self.ctx.registry.monitor.set_role(self.id, Role::Publishing, &name);
                 self.exec.publish(&self.ctx.exec, &app.exec, self.exec_vars(), &name, args);
+                let owner = crate::record::Owner {
+                    peer: Some(self.peer.clone()),
+                    vars: self.exec_vars(),
+                    form: self.notify_form(),
+                    args: args.to_string(),
+                    exec: self.ctx.exec.clone(),
+                    netcall_timeout: self.ctx.conf.netcall_timeout,
+                };
+                self.record =
+                    crate::record::Recording::start(&app.recorders, self.ctx.exec.prefix.as_deref(), &name, owner);
                 self.joined = Some(Joined { name, publishing: true, stream, _push_stop: push_stop });
                 self.last_av = Instant::now();
                 self.send(msg::status("NetStream.Publish.Start", "status", "Start publishing"))?;
@@ -1030,6 +1046,8 @@ impl Session {
     }
 
     fn leave_stream(&mut self) {
+        // ngx_rtmp_record_close_stream: close the files (record_done hooks).
+        self.record = None;
         if let Some(j) = self.joined.take() {
             debug!("leaving stream '{}' (publishing={})", j.name, j.publishing);
             drop(j.stream);

@@ -285,6 +285,11 @@ pub struct AppConf {
     pub access_logs: Vec<LogTarget>,
     // exec module
     pub exec: crate::exec::AppExec,
+    // record module
+    pub record: crate::record::RecordConf,
+    /// Named `recorder` blocks first, then the application's own settings
+    /// (when it records).
+    pub recorders: Vec<Arc<crate::record::Recorder>>,
 }
 
 impl Default for AppConf {
@@ -312,6 +317,8 @@ impl Default for AppConf {
             access_log: AccessLogConf::Unset,
             access_logs: Vec::new(),
             exec: crate::exec::AppExec::default(),
+            record: crate::record::RecordConf::default(),
+            recorders: Vec::new(),
         }
     }
 }
@@ -466,8 +473,12 @@ impl Config {
             let mut srv = srv_defaults.clone();
             let mut app_def = app_defaults.clone();
             let inherited_log = std::mem::take(&mut app_def.access_log);
+            let inherited_record = std::mem::take(&mut app_def.record.flags);
             for d in block.iter().filter(|d| d.name != "application") {
                 cx.apply_any(d, Some(&mut srv), &mut app_def)?;
+            }
+            if app_def.record.flags == 0 {
+                app_def.record.flags = inherited_record;
             }
             if app_def.access_log == AccessLogConf::Unset {
                 app_def.access_log = inherited_log;
@@ -481,7 +492,8 @@ impl Config {
                 // access rules accumulate in order: inherited only if none set locally
                 let inherited_access = std::mem::take(&mut app.access);
                 let inherited_log = std::mem::take(&mut app.access_log);
-                for d in ablock {
+                let inherited_record = std::mem::take(&mut app.record.flags);
+                for d in ablock.iter().filter(|d| d.name != "recorder") {
                     cx.apply_any(d, None, &mut app)?;
                 }
                 if app.access.is_empty() {
@@ -489,6 +501,29 @@ impl Config {
                 }
                 if app.access_log == AccessLogConf::Unset {
                     app.access_log = inherited_log;
+                }
+                if app.record.flags == 0 {
+                    app.record.flags = inherited_record;
+                }
+                // ngx_rtmp_record_recorder: a recorder block is a sub-application
+                // that inherits everything from the application.
+                for r in ablock.iter().filter(|d| d.name == "recorder") {
+                    let id = cx.one(r)?;
+                    let rblock = r.block.as_ref().ok_or_else(|| cx.err(r.line, "\"recorder\" needs a block"))?;
+                    let mut rapp = app.clone();
+                    let inherited = std::mem::take(&mut rapp.record.flags);
+                    for d in rblock {
+                        cx.apply_any(d, None, &mut rapp)?;
+                    }
+                    if rapp.record.flags == 0 {
+                        rapp.record.flags = inherited;
+                    }
+                    if let Some(rec) = crate::record::Recorder::new(id, &rapp) {
+                        app.recorders.push(Arc::new(rec));
+                    }
+                }
+                if let Some(rec) = crate::record::Recorder::new("", &app) {
+                    app.recorders.push(Arc::new(rec));
                 }
                 srv.applications.push(app);
             }
@@ -732,6 +767,26 @@ impl Cx<'_> {
             }
             "respawn" => a.exec.respawn = self.flag(d)?,
             "exec_options" => a.exec.options = self.flag(d)?,
+            "record" => {
+                if d.args.is_empty() {
+                    return Err(self.err(d.line, "invalid number of arguments in \"record\""));
+                }
+                for v in &d.args {
+                    let f = crate::record::parse_flag(v)
+                        .ok_or_else(|| self.err(d.line, format!("invalid value \"{v}\" in \"record\"")))?;
+                    a.record.flags |= f;
+                }
+            }
+            "record_path" => a.record.path = self.one(d)?.to_string(),
+            "record_suffix" => a.record.suffix = self.one(d)?.to_string(),
+            "record_unique" => a.record.unique = self.flag(d)?,
+            "record_append" => a.record.append = self.flag(d)?,
+            "record_lock" => a.record.lock = self.flag(d)?,
+            "record_notify" => a.record.notify = self.flag(d)?,
+            "record_max_size" => a.record.max_size = self.size(d)? as u64,
+            "record_max_frames" => a.record.max_frames = self.size(d)? as u64,
+            "record_interval" => a.record.interval = Some(self.time(d)?),
+            "recorder" => return Err(self.err(d.line, "\"recorder\" directive is only allowed in \"application\"")),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1141,6 +1196,55 @@ rtmp { server { } }", "t").is_err());
         assert!(b.respawn && b.push.is_empty() && b.publish.len() == 1);
         assert!(Config::parse("rtmp { exec_kill_signal BOGUS; server {} }", "t").is_err());
         assert!(Config::parse("rtmp { server { application a { exec; } } }", "t").is_err());
+    }
+
+    #[test]
+    fn record_directives() {
+        use crate::record::{AUDIO, KEYFRAMES, VIDEO};
+        let c = Config::parse(
+            r#"rtmp {
+                record all;
+                record_path /rec;
+                server {
+                    application a {
+                        record video keyframes;
+                        record_max_size 1M;
+                        record_interval 30m;
+                        on_record_done http://127.0.0.1/done;
+                        recorder audio {
+                            record audio;
+                            record_unique on;
+                            exec_record_done echo $path;
+                        }
+                        recorder same { record_suffix .x.flv; }
+                        recorder none { record off; }
+                    }
+                    application b { live on; }
+                    application c { record off; }
+                }
+            }"#,
+            "t",
+        )
+        .unwrap();
+        let s = &c.servers[0];
+        let a = s.app("a").unwrap();
+        let ids: Vec<&str> = a.recorders.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["audio", "same", ""], "named recorders, then the application");
+        let [audio, same, own] = &a.recorders[..] else { unreachable!() };
+        assert_eq!(own.conf.flags, VIDEO | KEYFRAMES, "a local record replaces the inherited one");
+        assert_eq!(own.conf.max_size, 1024 * 1024);
+        assert_eq!(own.conf.interval, Some(Duration::from_secs(1800)));
+        assert_eq!(audio.conf.flags, AUDIO);
+        assert!(audio.conf.unique && audio.conf.path == "/rec" && audio.conf.max_size == 1024 * 1024);
+        assert_eq!(audio.exec_done.len(), 1);
+        assert!(audio.on_done.is_some() && own.exec_done.is_empty());
+        assert_eq!(same.conf.flags, VIDEO | KEYFRAMES, "recorders inherit the application's flags");
+        assert_eq!(same.conf.suffix, ".x.flv");
+        assert_eq!(s.app("b").unwrap().recorders[0].conf.flags, AUDIO | VIDEO);
+        assert!(s.app("c").unwrap().recorders.is_empty());
+        assert!(Config::parse("rtmp { server { application a { record bogus; } } }", "t").is_err());
+        assert!(Config::parse("rtmp { server { recorder r { record all; } } }", "t").is_err());
+        assert!(Config::parse("rtmp { server { application a { recorder r { recorder q {} } } } }", "t").is_err());
     }
 
     #[test]
