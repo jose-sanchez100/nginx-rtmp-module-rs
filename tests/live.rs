@@ -3,10 +3,10 @@
 mod common;
 
 use common::{Client, av};
-use rtmp_server::amf::Amf0;
-use rtmp_server::config::Config;
-use rtmp_server::message::{self as msg, *};
-use rtmp_server::server::Server;
+use nginx_rtmp::amf::Amf0;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::message::{self as msg, *};
+use nginx_rtmp::server::Server;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -234,7 +234,7 @@ rtmp {
 
 #[tokio::test]
 async fn monitor_tracks_and_disconnects() {
-    use rtmp_server::monitor::Role;
+    use nginx_rtmp::monitor::Role;
     let server = Server::bind(Config::parse(CONF, "test").unwrap()).await.unwrap();
     let addr = server.local_addrs()[0];
     let registry = server.registry.clone();

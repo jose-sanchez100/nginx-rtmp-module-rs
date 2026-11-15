@@ -47,5 +47,5 @@ def live():
     return im
 
 sizes = [16, 20, 24, 32, 48, 64, 128, 256]
-for name, im in [('rtmp-server.ico', base()), ('rtmp-server-live.ico', live())]:
+for name, im in [('nginx.ico', base()), ('nginx-live.ico', live())]:
     im.resize((256, 256), Image.LANCZOS).save(f'{out}/{name}', sizes=[(s, s) for s in sizes])

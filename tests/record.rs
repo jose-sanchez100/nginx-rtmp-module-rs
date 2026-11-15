@@ -4,9 +4,9 @@
 mod common;
 
 use common::{Client, av};
-use rtmp_server::config::Config;
-use rtmp_server::message::*;
-use rtmp_server::server::Server;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::message::*;
+use nginx_rtmp::server::Server;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -162,10 +162,10 @@ async fn records_flv_and_runs_done_hooks() {
     publ.send(av(MSG_AUDIO, 1020, AUDIO)).await;
     publ.send(av(MSG_VIDEO, 1040, KEY)).await;
     publ.send(av(MSG_VIDEO, 1080, INTER)).await;
-    publ.send(rtmp_server::message::amf_cmd(
+    publ.send(nginx_rtmp::message::amf_cmd(
         8,
         1,
-        &[rtmp_server::amf::Amf0::str("deleteStream"), rtmp_server::amf::Amf0::Number(0.0), rtmp_server::amf::Amf0::Null],
+        &[nginx_rtmp::amf::Amf0::str("deleteStream"), nginx_rtmp::amf::Amf0::Number(0.0), nginx_rtmp::amf::Amf0::Null],
     ))
     .await;
     assert_eq!(publ.expect_status().await, "NetStream.Record.Stop");

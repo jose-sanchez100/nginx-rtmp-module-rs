@@ -4,11 +4,11 @@
 mod common;
 
 use common::{Client, av};
-use rtmp_server::amf::Amf0;
-use rtmp_server::config::Config;
-use rtmp_server::live::Registry;
-use rtmp_server::message::*;
-use rtmp_server::server::Server;
+use nginx_rtmp::amf::Amf0;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::live::Registry;
+use nginx_rtmp::message::*;
+use nginx_rtmp::server::Server;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

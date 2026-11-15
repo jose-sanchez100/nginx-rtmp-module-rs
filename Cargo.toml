@@ -1,5 +1,5 @@
 [package]
-name = "rtmp-server"
+name = "nginx-rtmp-module-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Rust port of nginx-rtmp-module as a standalone RTMP server"
@@ -7,7 +7,7 @@ license = "BSD-2-Clause"
 repository = "https://github.com/jose-sanchez100/nginx-rtmp-module-rs"
 
 [lib]
-name = "rtmp_server"
+name = "nginx_rtmp"
 path = "src/lib.rs"
 
 # Built as nginx.exe so it drops into an nginx folder in place of nginx.

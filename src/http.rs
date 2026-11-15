@@ -118,7 +118,7 @@ async fn serve(mut sock: TcpStream, addr: SocketAddr, ctx: &HttpCtx) -> std::io:
         }
     };
     let mut out = format!(
-        "HTTP/1.1 {} {}\r\nServer: rtmp-server/{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nServer: nginx-rtmp-module-rs/{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.status,
         reason(resp.status),
         env!("CARGO_PKG_VERSION"),

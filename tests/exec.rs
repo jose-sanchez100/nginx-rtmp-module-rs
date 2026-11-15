@@ -4,8 +4,8 @@
 mod common;
 
 use common::Client;
-use rtmp_server::config::Config;
-use rtmp_server::server::Server;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::server::Server;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

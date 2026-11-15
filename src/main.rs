@@ -2,9 +2,9 @@ mod daemon;
 #[cfg(windows)]
 mod tray;
 
-use rtmp_server::access_log::resolve_path;
-use rtmp_server::config::Config;
-use rtmp_server::server::Server;
+use nginx_rtmp::access_log::resolve_path;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::server::Server;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -20,7 +20,7 @@ const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-s stop|quit
 
 Errors go to the error log (error_log, default PREFIX/logs/error.log).
 Console output, when started from a terminal, is controlled by RUST_LOG
-(e.g. RUST_LOG=rtmp_server=debug).";
+(e.g. RUST_LOG=nginx_rtmp=debug).";
 
 const DEFAULT_ERROR_LOG: &str = "logs/error.log";
 const DEFAULT_PID: &str = "logs/nginx.pid";
@@ -101,7 +101,7 @@ async fn main() -> ExitCode {
         };
     }
     if test_only {
-        if let Err(e) = rtmp_server::access_log::open_all(&mut config) {
+        if let Err(e) = nginx_rtmp::access_log::open_all(&mut config) {
             return fail(e.to_string());
         }
         println!("nginx: configuration file {} test is successful", conf_path.display());

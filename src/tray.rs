@@ -5,8 +5,8 @@
 //! Plain Win32 on a thread of its own with its own message loop; it reads
 //! snapshots from the live registry once a second.
 
-use rtmp_server::live::{Registry, SessionId, StreamInfo};
-use rtmp_server::monitor::{ConnInfo, Role};
+use nginx_rtmp::live::{Registry, SessionId, StreamInfo};
+use nginx_rtmp::monitor::{ConnInfo, Role};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -30,7 +30,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// `NIN_KEYSELECT` (NIN_SELECT | NINF_KEY), missing from windows-sys.
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const TIMER_ID: usize = 1;
-const CLASS: &str = "rtmp-server-tray";
+const CLASS: &str = "nginx-rtmp-tray";
 
 /// What the tray needs to know about the running server.
 pub struct TrayOptions {
@@ -117,7 +117,7 @@ unsafe fn create_window() -> Option<HWND> {
             ..std::mem::zeroed()
         };
         RegisterClassW(&wc);
-        let title = wide("rtmp-server");
+        let title = wide("nginx");
         // A regular (never shown) window: menus need one that can take the foreground.
         let hwnd = CreateWindowExW(
             0,
@@ -456,7 +456,7 @@ impl State {
     fn tooltip(&self) -> String {
         let live: Vec<&StreamInfo> = self.streams.iter().filter(|s| s.publisher.is_some()).collect();
         let viewers: usize = self.streams.iter().map(|s| s.players.len()).sum();
-        let mut t = String::from("rtmp-server");
+        let mut t = String::from("nginx");
         match live.as_slice() {
             [] => t.push_str(" · idle"),
             [s] => t.push_str(&format!("\n● {}/{} · {} viewer{}", s.app, s.name, viewers, plural(viewers))),
@@ -536,7 +536,7 @@ impl State {
             .iter()
             .map(|(_, a, tls)| if *tls { format!("{a} (rtmps)") } else { a.to_string() })
             .collect();
-        self.add(root, &format!("rtmp-server · {}", ports.join(", ")), None, 0);
+        self.add(root, &format!("nginx · {}", ports.join(", ")), None, 0);
         let (rin, rout) = self.totals();
         self.add(
             root,
@@ -809,7 +809,7 @@ fn audio_codec(id: f64) -> String {
 }
 
 /// "1080p30".
-fn short_res(m: &rtmp_server::codec::MetaInfo) -> String {
+fn short_res(m: &nginx_rtmp::codec::MetaInfo) -> String {
     match (m.height as u32, m.frame_rate.round() as u32) {
         (0, _) => String::new(),
         (h, 0) => format!("{h}p"),

@@ -2,13 +2,13 @@
 #![allow(dead_code)]
 
 use bytes::{Bytes, BytesMut};
-use rtmp_server::amf::{self, Amf0};
-use rtmp_server::chunk::{ChunkDecoder, ChunkEncoder, Message};
-use rtmp_server::handshake;
-use rtmp_server::message::*;
+use nginx_rtmp::amf::{self, Amf0};
+use nginx_rtmp::chunk::{ChunkDecoder, ChunkEncoder, Message};
+use nginx_rtmp::handshake;
+use nginx_rtmp::message::*;
 use std::net::SocketAddr;
 use std::time::Duration;
-use rtmp_server::tls::BoxIo;
+use nginx_rtmp::tls::BoxIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;

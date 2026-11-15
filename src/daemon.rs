@@ -14,8 +14,8 @@ use tracing_subscriber::fmt::{self, format::Writer, time::FormatTime, MakeWriter
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{reload, EnvFilter, Registry};
 
-/// Our tracing targets: the lib (`rtmp_server`) and the binary (`nginx`).
-const TARGETS: [&str; 2] = ["rtmp_server", "nginx"];
+/// Our tracing targets: the lib (`nginx_rtmp`) and the binary (`nginx`).
+const TARGETS: [&str; 2] = ["nginx_rtmp", "nginx"];
 
 // ---------------------------------------------------------------------
 // Console
@@ -159,7 +159,7 @@ pub type SignalFuture = Pin<Box<dyn Future<Output = &'static str> + Send>>;
 
 #[cfg(windows)]
 fn event_name(sig: &str, pid: u32) -> Vec<u16> {
-    format!("rtmp-server_{sig}_{pid}").encode_utf16().chain([0]).collect()
+    format!("nginx-rtmp_{sig}_{pid}").encode_utf16().chain([0]).collect()
 }
 
 /// `-s stop|quit`: signal the running server, like `nginx -s`. On Windows

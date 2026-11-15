@@ -59,7 +59,7 @@ rtmp {
 ```
 
 `conf/nginx.conf` has commented examples for relays, recording, stat and control.
-Logging to the terminal follows `RUST_LOG` (e.g. `RUST_LOG=rtmp_server=debug`).
+Logging to the terminal follows `RUST_LOG` (e.g. `RUST_LOG=nginx_rtmp=debug`).
 
 ## Tests
 

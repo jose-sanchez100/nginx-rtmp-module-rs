@@ -98,7 +98,7 @@ The port is a **standalone RTMP server** on `tokio`:
   serve static files from `root` (default `html`, relative to the prefix). No
   `listen ... ssl`, no keep-alive (each response closes the connection). Query
   arguments are URL-decoded (nginx compares them raw).
-- Stat: `<nginx_version>` reports `rtmp-server/VERSION` and `<built>` the
+- Stat: `<nginx_version>` reports `nginx-rtmp-module-rs/VERSION` and `<built>` the
   executable's modification time. Non-ASCII text is kept as UTF-8 (nginx turns
   every non-ASCII byte into a space). In each stream the publisher is listed first.
   Relay connections show their upstream URL as `<address>`; the global byte

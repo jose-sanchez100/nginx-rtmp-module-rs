@@ -4,10 +4,10 @@
 mod common;
 
 use common::{Client, av};
-use rtmp_server::amf::Amf0;
-use rtmp_server::config::Config;
-use rtmp_server::message::*;
-use rtmp_server::server::Server;
+use nginx_rtmp::amf::Amf0;
+use nginx_rtmp::config::Config;
+use nginx_rtmp::message::*;
+use nginx_rtmp::server::Server;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
 use std::sync::Arc;
@@ -87,7 +87,7 @@ async fn plain_client_on_tls_port_is_dropped() {
     let addr = server.local_addrs()[0];
     tokio::spawn(server.run());
     let mut sock = TcpStream::connect(addr).await.unwrap();
-    let r = tokio::time::timeout(std::time::Duration::from_secs(5), rtmp_server::handshake::client(&mut sock, 0)).await;
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), nginx_rtmp::handshake::client(&mut sock, 0)).await;
     assert!(matches!(r, Ok(Err(_))), "an RTMP handshake must not succeed on an RTMPS port");
 }
 
@@ -105,7 +105,7 @@ fn ssl_listen_needs_certificate() {
 
 #[test]
 fn rtmps_urls() {
-    use rtmp_server::config::RelayTarget;
+    use nginx_rtmp::config::RelayTarget;
     let t = RelayTarget::parse_url("rtmps://live-api-s.facebook.com:443/rtmp/KEY").unwrap();
     assert!(t.tls);
     assert_eq!((t.host.as_str(), t.port, t.app.as_str(), t.play_path.as_str()), ("live-api-s.facebook.com", 443, "rtmp", "KEY"));
@@ -121,7 +121,7 @@ fn rtmps_urls() {
 #[ignore]
 async fn real_ingest_servers() {
     for (host, app) in [("live-api-s.facebook.com", "rtmp"), ("a.rtmps.youtube.com", "live2")] {
-        let sock = rtmp_server::tls::connect(host, 443, true).await.unwrap_or_else(|e| panic!("{host}: {e}"));
+        let sock = nginx_rtmp::tls::connect(host, 443, true).await.unwrap_or_else(|e| panic!("{host}: {e}"));
         let mut c = Client::connect_io(sock, &format!("rtmps://{host}:443/{app}"), app).await;
         let r = c.expect_amf("_result").await;
         println!("{host}: {:?}", r[3].get("code"));

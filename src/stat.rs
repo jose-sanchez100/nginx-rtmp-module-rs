@@ -198,7 +198,7 @@ pub fn xml(servers: &[Arc<ServerCtx>], registry: &Registry, mask: u8, stylesheet
     let g = &registry.stats;
     let _ = write!(
         o,
-        "<rtmp>\r\n<nginx_version>rtmp-server/{}</nginx_version>\r\n\
+        "<rtmp>\r\n<nginx_version>nginx-rtmp-module-rs/{}</nginx_version>\r\n\
          <nginx_rtmp_version>1.1.4</nginx_rtmp_version>\r\n<compiler>rustc</compiler>\r\n\
          <built>{}</built>\r\n<pid>{}</pid>\r\n<uptime>{}</uptime>\r\n<naccepted>{}</naccepted>\r\n",
         env!("CARGO_PKG_VERSION"),
