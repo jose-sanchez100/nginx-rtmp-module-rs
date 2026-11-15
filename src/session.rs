@@ -38,12 +38,16 @@ pub struct ServerCtx {
     pub conf: ServerConf,
     pub apps: Vec<Arc<AppConf>>,
     pub registry: Arc<Registry>,
+    /// Global exec settings (`exec_static`, `respawn_timeout`, ...).
+    pub exec: Arc<crate::exec::MainExec>,
+    /// Running `exec_pull` children.
+    pub exec_pulls: crate::exec::PullTable,
 }
 
 impl ServerCtx {
     pub fn new(index: usize, conf: ServerConf, registry: Arc<Registry>) -> Self {
         let apps = conf.applications.iter().cloned().map(Arc::new).collect();
-        Self { index, conf, apps, registry }
+        Self { index, conf, apps, registry, exec: Arc::default(), exec_pulls: Default::default() }
     }
 }
 
@@ -136,6 +140,8 @@ struct Session {
     log: LogCtx,
     /// Received bytes, shared with the monitor.
     bytes_in: Arc<AtomicU64>,
+    /// exec module children of this session.
+    exec: crate::exec::SessionExec,
 }
 
 #[derive(Default)]
@@ -217,11 +223,13 @@ where
         notify: None,
         log: LogCtx::default(),
         bytes_in,
+        exec: Default::default(),
     };
 
     let result = s.read_loop(&mut rd).await;
     s.leave_stream();
     s.notify_done();
+    s.exec_done();
     s.notify_disconnect();
     let Session { peer, app, app_name, flashver, swf_url, tc_url, page_url, log, .. } = s;
     drop(peer); // closes the channel; writer flushes what is queued and exits
@@ -697,6 +705,7 @@ impl Session {
             Ok(stream) => {
                 let push_stop = crate::relay::start_pushes(&self.ctx, &app, &name, redirect_push);
                 self.ctx.registry.monitor.set_role(self.id, Role::Publishing, &name);
+                self.exec.publish(&self.ctx.exec, &app.exec, self.exec_vars(), &name, args);
                 self.joined = Some(Joined { name, publishing: true, stream, _push_stop: push_stop });
                 self.last_av = Instant::now();
                 self.send(msg::status("NetStream.Publish.Start", "status", "Start publishing"))?;
@@ -756,6 +765,9 @@ impl Session {
         // ngx_rtmp_cmd_stream_begin / ngx_rtmp_live_play
         self.send(msg::stream_begin(MSID))?;
         crate::relay::maybe_pull(&self.ctx, &app, &name, redirect_pull);
+        // Before joining: exec_pull may start the stream's publisher.
+        let vars = self.exec_vars();
+        self.exec.play(&self.ctx.exec, &app.exec, &self.ctx.exec_pulls, &app.name, vars, &name, args);
         match self.ctx.registry.play(self.ctx.index, &app, &name, &self.peer) {
             Ok(stream) => {
                 if !app.play_restart {
@@ -776,6 +788,7 @@ impl Session {
 
     fn cmd_close_stream(&mut self) -> Result<()> {
         self.notify_done();
+        self.exec_done();
         let Some(j) = &self.joined else { return Ok(()) };
         let publishing = j.publishing;
         let play_restart = self.app.as_ref().is_some_and(|a| a.play_restart);
@@ -993,6 +1006,26 @@ impl Session {
             self.log.publish = true;
         } else {
             self.log.play = true;
+        }
+    }
+
+    /// Session variables for exec arguments (`ngx_rtmp_eval_session`).
+    fn exec_vars(&self) -> crate::exec::Vars {
+        vec![
+            ("app", self.app_name.clone()),
+            ("flashver", self.flashver.clone()),
+            ("swfurl", self.swf_url.clone()),
+            ("tcurl", self.tc_url.clone()),
+            ("pageurl", self.page_url.clone()),
+            ("addr", self.addr.ip().to_string()),
+        ]
+    }
+
+    /// `ngx_rtmp_exec_close_stream`.
+    fn exec_done(&mut self) {
+        if let Some(app) = self.app.clone() {
+            let vars = self.exec_vars();
+            self.exec.close(&self.ctx.exec, &app.exec, vars);
         }
     }
 

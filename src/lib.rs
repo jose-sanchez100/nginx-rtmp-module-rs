@@ -8,6 +8,7 @@ pub mod amf;
 pub mod chunk;
 pub mod codec;
 pub mod config;
+pub mod exec;
 pub mod handshake;
 pub mod live;
 pub mod message;

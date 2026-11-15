@@ -14,6 +14,7 @@ use tracing::{error, info};
 pub struct Server {
     listeners: Vec<(TcpListener, Arc<ServerCtx>, Option<TlsAcceptor>)>,
     pub registry: Arc<Registry>,
+    exec: Arc<crate::exec::MainExec>,
 }
 
 impl Server {
@@ -23,6 +24,7 @@ impl Server {
         let mut listeners = Vec::new();
         let mut seen = HashSet::new();
         let prefix = config.prefix.clone();
+        let exec = Arc::new(crate::exec::MainExec { prefix: prefix.clone(), ..config.exec.clone() });
         for (index, srv) in config.servers.into_iter().enumerate() {
             let addrs = srv.listen.clone();
             let acceptor = match (&srv.ssl_certificate, &srv.ssl_certificate_key) {
@@ -33,7 +35,9 @@ impl Server {
                 _ => None,
             };
             let ssl = srv.listen_ssl.clone();
-            let ctx = Arc::new(ServerCtx::new(index, srv, registry.clone()));
+            let mut ctx = ServerCtx::new(index, srv, registry.clone());
+            ctx.exec = exec.clone();
+            let ctx = Arc::new(ctx);
             for (addr, ssl) in addrs.into_iter().zip(ssl) {
                 // Port 0 (any free port) never clashes.
                 if addr.port() != 0 && !seen.insert(addr) {
@@ -50,7 +54,7 @@ impl Server {
                 listeners.push((l, ctx.clone(), tls));
             }
         }
-        Ok(Self { listeners, registry })
+        Ok(Self { listeners, registry, exec })
     }
 
     /// Bound addresses with the index of their `server {}` block and
@@ -67,6 +71,8 @@ impl Server {
     }
 
     pub async fn run(self) {
+        // exec_static children live as long as this future.
+        let _statics = self.exec.start_statics();
         let mut tasks = Vec::new();
         let mut started = HashSet::new();
         for (l, ctx, tls) in self.listeners {

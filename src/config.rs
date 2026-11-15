@@ -283,6 +283,8 @@ pub struct AppConf {
     pub access_log: AccessLogConf,
     /// Opened targets for `access_log` (filled by `access_log::open_all`).
     pub access_logs: Vec<LogTarget>,
+    // exec module
+    pub exec: crate::exec::AppExec,
 }
 
 impl Default for AppConf {
@@ -309,6 +311,7 @@ impl Default for AppConf {
             notify: AppNotify::new(),
             access_log: AccessLogConf::Unset,
             access_logs: Vec::new(),
+            exec: crate::exec::AppExec::default(),
         }
     }
 }
@@ -397,6 +400,8 @@ pub struct Config {
     pub error_log: Option<ErrorLogConf>,
     /// Top-level `pid file`.
     pub pid: Option<String>,
+    /// `exec_static`, `respawn_timeout`, `exec_kill_signal` (global).
+    pub exec: crate::exec::MainExec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,6 +426,7 @@ impl Config {
             file,
             warnings: Vec::new(),
             formats: vec![("combined".to_string(), LogFormat::combined())],
+            exec: crate::exec::MainExec::default(),
         };
         let mut error_log = None;
         let mut pid = None;
@@ -503,7 +509,7 @@ impl Config {
         for w in cx.warnings {
             tracing::warn!("{w}");
         }
-        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid })
+        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid, exec: cx.exec })
     }
 }
 
@@ -511,6 +517,7 @@ struct Cx<'a> {
     file: &'a str,
     warnings: Vec<String>,
     formats: Vec<(String, LogFormat)>,
+    exec: crate::exec::MainExec,
 }
 
 impl Cx<'_> {
@@ -705,9 +712,45 @@ impl Cx<'_> {
             "notify_update_timeout" => a.notify.update_timeout = self.time(d)?,
             "notify_update_strict" => a.notify.update_strict = self.flag(d)?,
             "notify_relay_redirect" => a.notify.relay_redirect = self.flag(d)?,
+            "exec" | "exec_push" => a.exec.push.push(self.exec_conf(d, a.exec.options)?),
+            "exec_pull" => a.exec.pull.push(self.exec_conf(d, a.exec.options)?),
+            "exec_publish" => a.exec.publish.push(self.exec_conf(d, a.exec.options)?),
+            "exec_publish_done" => a.exec.publish_done.push(self.exec_conf(d, a.exec.options)?),
+            "exec_play" => a.exec.play.push(self.exec_conf(d, a.exec.options)?),
+            "exec_play_done" => a.exec.play_done.push(self.exec_conf(d, a.exec.options)?),
+            "exec_record_done" => a.exec.record_done.push(self.exec_conf(d, a.exec.options)?),
+            // Global in nginx wherever they are written.
+            "exec_static" => {
+                let c = self.exec_conf(d, a.exec.options)?;
+                self.exec.statics.push(c);
+            }
+            "respawn_timeout" => self.exec.respawn_timeout = self.time(d)?,
+            "exec_kill_signal" => {
+                let v = self.one(d)?;
+                self.exec.kill_signal = crate::exec::KillSignal::parse(v)
+                    .ok_or_else(|| self.err(d.line, format!("unknown signal \"{v}\"")))?;
+            }
+            "respawn" => a.exec.respawn = self.flag(d)?,
+            "exec_options" => a.exec.options = self.flag(d)?,
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// `exec* cmd [args...]`; with `exec_options on`, `name=X` arguments
+    /// are stream filters.
+    fn exec_conf(&self, d: &Directive, options: bool) -> Result<Arc<crate::exec::ExecConf>, ConfigError> {
+        let [cmd, rest @ ..] = d.args.as_slice() else {
+            return Err(self.err(d.line, format!("invalid number of arguments in \"{}\"", d.name)));
+        };
+        let mut c = crate::exec::ExecConf { cmd: cmd.clone(), args: Vec::new(), names: Vec::new() };
+        for a in rest {
+            match a.strip_prefix("name=") {
+                Some(n) if options => c.names.push(n.to_string()),
+                _ => c.args.push(a.clone()),
+            }
+        }
+        Ok(Arc::new(c))
     }
 
     fn notify_url(&self, d: &Directive) -> Result<Arc<NotifyUrl>, ConfigError> {
@@ -1060,6 +1103,44 @@ rtmp { server { } }", "t").unwrap();
 rtmp { server { } }", "t").is_err());
         let c = Config::parse("rtmp { server { } }", "t").unwrap();
         assert!(c.pid.is_none() && c.error_log.is_none());
+    }
+
+    #[test]
+    fn exec_directives() {
+        let c = Config::parse(
+            r#"rtmp {
+                respawn_timeout 2s;
+                exec_kill_signal term;
+                exec_static C:\tools\cam.exe -x;
+                server {
+                    exec_publish notify.bat $name;
+                    application a {
+                        exec ffmpeg -i rtmp://localhost/a/$name -f flv rtmp://x/$name 2>>logs/ff.log;
+                        exec_options on;
+                        exec_pull ffmpeg name=cam1 name=cam2 -re;
+                        respawn off;
+                    }
+                    application b { live on; }
+                }
+            }"#,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(c.exec.respawn_timeout, Duration::from_secs(2));
+        assert_eq!(c.exec.kill_signal, crate::exec::KillSignal::Other("TERM".into()));
+        assert_eq!(c.exec.statics.len(), 1);
+        assert_eq!(c.exec.statics[0].cmd, r"C:\tools\cam.exe");
+        let a = &c.servers[0].app("a").unwrap().exec;
+        assert_eq!(a.push[0].args.last().unwrap(), "2>>logs/ff.log");
+        assert!(a.push[0].names.is_empty());
+        assert_eq!(a.pull[0].names, vec!["cam1", "cam2"]);
+        assert_eq!(a.pull[0].args, vec!["-re"]);
+        assert!(!a.respawn && a.is_active());
+        assert_eq!(a.publish.len(), 1, "server-level exec_publish is inherited");
+        let b = &c.servers[0].app("b").unwrap().exec;
+        assert!(b.respawn && b.push.is_empty() && b.publish.len() == 1);
+        assert!(Config::parse("rtmp { exec_kill_signal BOGUS; server {} }", "t").is_err());
+        assert!(Config::parse("rtmp { server { application a { exec; } } }", "t").is_err());
     }
 
     #[test]

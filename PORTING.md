@@ -40,7 +40,7 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_play_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
 | `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull` (also `rtmps://`, see below), `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
 | `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` is parsed but waits for `record` |
-| `ngx_rtmp_exec_module.c` | — | ⬜ `exec*` |
+| `ngx_rtmp_exec_module.c` | `src/exec.rs` | ✅ `exec`, `exec_push`, `exec_pull`, `exec_static`, `exec_publish`, `exec_publish_done`, `exec_play`, `exec_play_done`, `respawn`, `respawn_timeout`, `exec_kill_signal`, `exec_options` (`name=`); `$var` arguments and `>file` / `2>>file` / `2>&1` redirection. Works on Windows (the C module is compiled out there). `exec_record_done` is parsed but waits for `record` |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
 | `ngx_rtmp_log_module.c` | `access_log.rs` | ✅ `access_log`, `log_format`, all variables |
 | `ngx_rtmp_stat_module.c`, `ngx_rtmp_control_module.c` | — | ⬜ need an HTTP endpoint of their own |
@@ -75,6 +75,12 @@ The port is a **standalone RTMP server** on `tokio`:
   `emerg`. `-s quit` exits at once like `-s stop` (no graceful drain);
   `-s reload` / `-s reopen` are not supported.
 
+- Exec: `exec_push` children start after the publish succeeds (nginx starts them
+  before the live module, so a rejected second publisher briefly runs its own copy).
+  Only file descriptors 0-2 can be redirected. On Windows a backslash in arguments is
+  a path separator, not an escape (`C:\rec\$name.flv`). `name=` filters match any of
+  the listed names (nginx compares only the first).
+
 ## Running
 
 Like nginx, the binary has a prefix directory: relative paths in the configuration
@@ -108,6 +114,29 @@ for RTMPS. The port does it natively (`src/tls.rs`, rustls with `ring`):
   `ssl_certificate_key` (PEM, nginx syntax; relative paths resolve against the
   prefix) in `server {}` or `rtmp {}`. Plain and `ssl` listeners can be mixed.
 - A TLS peer that closes without `close_notify` is treated as a normal close.
+
+### exec on Windows (not in nginx)
+
+nginx-rtmp-module compiles `exec*` out on Windows. Here it works the same as on Linux,
+so ffmpeg relays or transcoders can be tied to a stream instead of being started by
+hand:
+
+```nginx
+application live {
+    live on;
+    exec ffmpeg -i rtmp://127.0.0.1/live/$name -c:v libx264 -b:v 3000k -c:a copy
+        -f flv rtmps://live-api-s.facebook.com:443/rtmp/KEY 2>>logs/ffmpeg-$name.log;
+}
+```
+
+- Children never open a console window, even when the server runs without one.
+- Each managed child (`exec`, `exec_pull`, `exec_static`) runs in its own Job Object:
+  stopping it kills the whole tree (so `cmd /c script.bat` wrappers work), and if the
+  server dies, even forcibly, its children die with it (Linux uses `prctl` for this).
+- Children run in the prefix directory; a relative program path (`scripts/x.bat`) and
+  redirect files are relative to the prefix, a bare name (`ffmpeg`) is looked up in
+  `PATH`. Missing log directories for redirects are created.
+- `exec_kill_signal` is accepted but Windows always terminates the process.
 
 ### Tray icon (Windows, not in nginx)
 
