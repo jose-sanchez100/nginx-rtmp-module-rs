@@ -1,5 +1,5 @@
-//! Embed the icons on Windows builds: 1 = executable / idle tray icon (the
-//! nginx icon), 2 = tray icon while a stream is live.
+//! Embed the icons on Windows builds: 1 = executable / idle tray icon (drawn by
+//! assets/make_icons.py), 2 = tray icon while a stream is live.
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/rtmp-server.ico");

@@ -170,7 +170,7 @@ application live {
 While serving, the binary shows an icon in the notification area (`src/tray.rs`, fed
 by `src/monitor.rs` and `live::Registry::streams`):
 
-- The nginx icon, with a red dot while any stream has a publisher.
+- A green hexagon icon (assets/make_icons.py), with a red dot while any stream has a publisher.
 - Tooltip: live streams, viewer count, total ↓/↑ bitrate.
 - A toast when a stream goes live (resolution, frame rate, codecs, source address)
   and when it ends (duration, data received); can be turned off from the menu.
