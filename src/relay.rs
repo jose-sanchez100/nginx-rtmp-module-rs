@@ -446,24 +446,35 @@ pub fn maybe_pull(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str, target: 
 }
 
 /// Start every `pull ... static` of a server block.
-pub fn start_static_pulls(ctx: &Arc<ServerCtx>) {
-    for app in &ctx.apps {
-        for t in &app.static_pulls {
-            let span = tracing::info_span!("static_pull", stream = %t.name, url = %t.url);
-            let (ctx, app, t) = (ctx.clone(), app.clone(), t.clone());
-            tokio::spawn(
-                async move {
-                    loop {
-                        match pull_once(&ctx, &app, &t.name, &t, true).await {
-                            Ok(()) => info!("static pull ended"),
-                            Err(e) => warn!("static pull failed: {e}"),
-                        }
-                        tokio::time::sleep(app.pull_reconnect).await;
-                    }
+/// Run one `pull ... static` until the returned task is aborted,
+/// reconnecting after `pull_reconnect`.
+pub fn spawn_static_pull(ctx: Arc<ServerCtx>, app: Arc<AppConf>, t: Arc<RelayTarget>) -> tokio::task::JoinHandle<()> {
+    let span = tracing::info_span!("static_pull", stream = %t.name, url = %t.url);
+    tokio::spawn(
+        async move {
+            loop {
+                match pull_once(&ctx, &app, &t.name, &t, true).await {
+                    Ok(()) => info!("static pull ended"),
+                    Err(e) => warn!("static pull failed: {e}"),
                 }
-                .instrument(span),
-            );
+                tokio::time::sleep(app.pull_reconnect).await;
+            }
         }
+        .instrument(span),
+    )
+}
+
+/// Leaves the stream when a pull ends, also when its task is aborted.
+struct LeaveGuard<'a> {
+    ctx: &'a ServerCtx,
+    app: &'a str,
+    name: &'a str,
+    id: crate::live::SessionId,
+}
+
+impl Drop for LeaveGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.registry.leave(self.ctx.index, self.app, self.name, self.id);
     }
 }
 
@@ -512,6 +523,7 @@ async fn pull_once(
         .registry
         .publish(ctx.index, app, name, &peer)
         .map_err(|e| RelayError::Local(e.to_string()))?;
+    let leave = LeaveGuard { ctx, app: &app.name, name, id };
 
     // Pulled streams are recorded too (nginx's relay session goes through
     // ngx_rtmp_publish). There is no client: only $app and $name are known.
@@ -530,7 +542,7 @@ async fn pull_once(
     let r = pull_pump(&mut c, app, &stream, is_static, &mut rec, &close, &mut ctl).await;
     drop(rec);
     drop(stream);
-    ctx.registry.leave(ctx.index, &app.name, name, id);
+    drop(leave);
     r
 }
 

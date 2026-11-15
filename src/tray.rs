@@ -9,11 +9,13 @@ use nginx_rtmp::live::{Registry, SessionId, StreamInfo};
 use nginx_rtmp::monitor::{ConnInfo, Role};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use tokio::sync::Notify;
+use crate::TrayCmd;
+use nginx_rtmp::server::ListenInfo;
+use tokio::sync::mpsc::UnboundedSender;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -35,11 +37,14 @@ const CLASS: &str = "nginx-rtmp-tray";
 /// What the tray needs to know about the running server.
 pub struct TrayOptions {
     pub registry: Arc<Registry>,
-    pub listen: Vec<(usize, SocketAddr, bool)>,
+    /// Bound RTMP addresses (updated when the configuration is reloaded).
+    pub listen: Arc<RwLock<ListenInfo>>,
     pub conf_path: PathBuf,
     pub logs_dir: PathBuf,
-    /// Notified when the user picks "Stop server".
-    pub stop: Arc<Notify>,
+    /// Stop, reload and configure requests for the main task.
+    pub commands: UnboundedSender<TrayCmd>,
+    /// Notifications (title, text) to show, queued by the main task.
+    pub toasts: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// Removes the icon and ends the tray thread when dropped.
@@ -234,7 +239,7 @@ enum Action {
     Open(PathBuf),
     Disconnect(SessionId),
     ToggleNotify,
-    Stop,
+    Command(TrayCmd),
 }
 
 struct Seen {
@@ -393,6 +398,10 @@ impl State {
 
     fn tick(&mut self) {
         self.refresh();
+        let queued = std::mem::take(&mut *self.opts.toasts.lock().unwrap());
+        for (title, text) in queued {
+            self.toast(&title, &text);
+        }
 
         // Stream start / end toasts. A stream is announced on its second
         // tick, once its metadata (resolution, frame rate) has arrived.
@@ -507,7 +516,8 @@ impl State {
     /// server listens on every interface.
     fn urls(&self, s: &StreamInfo) -> Vec<(&'static str, String)> {
         // Prefer a plain listener: players connect to it without certificate trouble.
-        let mut mine: Vec<_> = self.opts.listen.iter().filter(|(i, _, _)| *i == s.server).collect();
+        let listen = self.opts.listen.read().unwrap().clone();
+        let mut mine: Vec<_> = listen.iter().filter(|(i, _, _)| *i == s.server).collect();
         mine.sort_by_key(|(_, _, tls)| *tls);
         let Some(&&(_, addr, tls)) = mine.first() else { return vec![] };
         let (scheme, default_port) = if tls { ("rtmps", 443) } else { ("rtmp", 1935) };
@@ -530,9 +540,8 @@ impl State {
         self.actions.clear();
         let root = Self::new_menu();
 
-        let ports: Vec<String> = self
-            .opts
-            .listen
+        let listen = self.opts.listen.read().unwrap().clone();
+        let ports: Vec<String> = listen
             .iter()
             .map(|(_, a, tls)| if *tls { format!("{a} (rtmps)") } else { a.to_string() })
             .collect();
@@ -555,9 +564,7 @@ impl State {
 
         let streams = self.streams.clone();
         if streams.is_empty() {
-            let hint = self
-                .opts
-                .listen
+            let hint = listen
                 .first()
                 .map(|(_, a, _)| format!("No streams · publish to rtmp://127.0.0.1:{}/<app>/<key>", a.port()))
                 .unwrap_or_else(|| "No streams".into());
@@ -615,10 +622,12 @@ impl State {
         Self::sep(root);
 
         self.add(root, "Notify when streams start and end", Some(Action::ToggleNotify), if self.notify { MF_CHECKED } else { 0 });
+        self.add(root, "Configure…", Some(Action::Command(TrayCmd::Configure)), 0);
+        self.add(root, "Reload configuration", Some(Action::Command(TrayCmd::Reload)), 0);
         self.add(root, "Open nginx.conf", Some(Action::Open(self.opts.conf_path.clone())), 0);
         self.add(root, "Open logs folder", Some(Action::Open(self.opts.logs_dir.clone())), 0);
         Self::sep(root);
-        self.add(root, "Stop server", Some(Action::Stop), 0);
+        self.add(root, "Stop server", Some(Action::Command(TrayCmd::Stop)), 0);
         root
     }
 
@@ -689,7 +698,9 @@ impl State {
                 self.opts.registry.monitor.disconnect(*id);
             }
             Action::ToggleNotify => self.notify = !self.notify,
-            Action::Stop => self.opts.stop.notify_one(),
+            Action::Command(c) => {
+                let _ = self.opts.commands.send(*c);
+            }
         }
     }
 }

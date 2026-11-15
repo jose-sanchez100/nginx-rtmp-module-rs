@@ -74,7 +74,14 @@ The port is a **standalone RTMP server** on `tokio`:
 - Error log: only the first top-level `error_log` is used; `notice` maps to `info` and
   `crit`/`alert`/`emerg` to `error`. Unsupported directives are warnings, not
   `emerg`. `-s quit` exits at once like `-s stop` (no graceful drain);
-  `-s reload` / `-s reopen` are not supported.
+  `-s reopen` is not supported.
+- Reload (`-s reload`, the tray icon, the editor): there are no worker processes, so
+  the new configuration applies to new connections and existing ones keep the
+  settings they started with. Every new listener is bound before anything changes;
+  if one fails (or the file has an error) the running configuration is kept.
+  Listeners on unchanged addresses stay open. Static pulls and `exec_static`
+  commands are restarted only when their own settings changed. `pid` changes take
+  effect at the next start.
 
 - Exec: `exec_push` children start after the publish succeeds (nginx starts them
   before the live module, so a rejected second publisher briefly runs its own copy).
@@ -123,8 +130,30 @@ process releases its console, so no window stays open; started from a terminal i
 keeps logging there (filtered by `RUST_LOG`). Errors always go to the error log:
 top-level `error_log file [level]`, default `PREFIX/logs/error.log` at level
 `error`. The PID is written to `pid` (default `PREFIX/logs/nginx.pid`) and removed
-on exit; `-s stop` / `-s quit` stops the running server (a named event on Windows,
-SIGTERM / SIGQUIT elsewhere), so an existing `stop.bat` keeps working.
+on exit; `-s stop` / `-s quit` stops the running server and `-s reload` makes it
+read the configuration again (named events on Windows, SIGTERM / SIGQUIT / SIGHUP
+elsewhere), so an existing `stop.bat` keeps working.
+
+### Configuration editor (not in nginx)
+
+`nginx -e`, or "Configure…" in the tray menu, opens `nginx.conf` in the browser
+(`src/editor.rs`, `src/editor.html`), served on 127.0.0.1 with a random token in the
+URL:
+
+- A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
+  `location`) and, for the selected one, a form with every directive: on/off
+  switches, choices, checkboxes for `record` / `rtmp_stat` / `listen ... ssl`,
+  `key=value` rows for relay parameters, with the description and default of each
+  directive (`src/conf_schema.rs`, which lists everything the server understands).
+- Add, delete, reorder, disable (comment out) and enable directives; add blocks.
+  Directives the server does not use are kept and can be edited as text.
+- Every change is checked by the real parser; errors and warnings show at once.
+- A Text tab edits the whole file directly.
+- Save & reload checks the file, keeps the previous one as `nginx.conf.bak`, writes
+  it and reloads the running server (with `-e`, by sending `-s reload`). A file
+  changed by another program in the meantime is not overwritten without asking.
+- Comments, blank lines and the spelling of untouched directives are kept
+  (`src/conf_edit.rs`); only indentation is normalised to four spaces.
 
 ### RTMPS (not in nginx)
 
@@ -177,8 +206,8 @@ by `src/monitor.rs` and `live::Registry::streams`):
 - Menu (left or right click): every stream with resolution, bitrate and viewers; per
   stream, copy its `rtmp://` URL (local and LAN), watch it in ffplay / VLC when
   installed, see and disconnect viewers or the publisher; every connection with its
-  role, client, duration, bitrate and totals; open `nginx.conf` / the logs folder;
-  stop the server.
+  role, client, duration, bitrate and totals; open the configuration editor, reload
+  the configuration, open `nginx.conf` / the logs folder; stop the server.
 
 ## Testing
 

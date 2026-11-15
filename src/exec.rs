@@ -128,15 +128,15 @@ impl MainExec {
     /// Start the `exec_static` children; they run until the returned
     /// handles are dropped.
     pub fn start_statics(&self) -> Vec<Managed> {
-        self.statics
-            .iter()
-            .map(|c| {
-                let span = tracing::info_span!("exec_static", cmd = %c.cmd);
-                let _g = span.enter();
-                // Static commands are not evaluated (no session).
-                spawn_managed(prepare(c, None, self.prefix.as_deref()), Some(self.respawn_timeout), self.kill_signal.clone())
-            })
-            .collect()
+        self.statics.iter().map(|c| self.start_static(c)).collect()
+    }
+
+    /// Start one `exec_static` child, running until the handle is dropped.
+    pub fn start_static(&self, c: &ExecConf) -> Managed {
+        let span = tracing::info_span!("exec_static", cmd = %c.cmd);
+        let _g = span.enter();
+        // Static commands are not evaluated (no session).
+        spawn_managed(prepare(c, None, self.prefix.as_deref()), Some(self.respawn_timeout), self.kill_signal.clone())
     }
 }
 

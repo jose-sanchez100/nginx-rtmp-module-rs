@@ -3,10 +3,8 @@
 //! Explorer so no window stays open.
 
 use std::fs::{File, OpenOptions};
-use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use tracing::Level;
 use tracing_subscriber::filter::{LevelFilter, Targets};
@@ -153,17 +151,18 @@ pub fn read_pid(path: &Path) -> Result<u32, String> {
 }
 
 /// Signals accepted by `-s`.
-pub const SIGNALS: [&str; 2] = ["stop", "quit"];
+pub const SIGNALS: [&str; 3] = ["stop", "quit", "reload"];
 
-pub type SignalFuture = Pin<Box<dyn Future<Output = &'static str> + Send>>;
+/// Signals received by this process, by name.
+pub type Signals = tokio::sync::mpsc::UnboundedReceiver<&'static str>;
 
 #[cfg(windows)]
 fn event_name(sig: &str, pid: u32) -> Vec<u16> {
     format!("nginx-rtmp_{sig}_{pid}").encode_utf16().chain([0]).collect()
 }
 
-/// `-s stop|quit`: signal the running server, like `nginx -s`. On Windows
-/// this sets a named event the server waits on.
+/// `-s stop|quit|reload`: signal the running server, like `nginx -s`. On
+/// Windows this sets a named event the server waits on.
 #[cfg(windows)]
 pub fn send_signal(sig: &str, pid: u32) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -184,7 +183,11 @@ pub fn send_signal(sig: &str, pid: u32) -> Result<(), String> {
 
 #[cfg(unix)]
 pub fn send_signal(sig: &str, pid: u32) -> Result<(), String> {
-    let s = if sig == "quit" { "-QUIT" } else { "-TERM" };
+    let s = match sig {
+        "quit" => "-QUIT",
+        "reload" => "-HUP",
+        _ => "-TERM",
+    };
     match std::process::Command::new("kill").args([s, &pid.to_string()]).status() {
         Ok(st) if st.success() => Ok(()),
         Ok(st) => Err(format!("kill {s} {pid} failed: {st}")),
@@ -192,10 +195,9 @@ pub fn send_signal(sig: &str, pid: u32) -> Result<(), String> {
     }
 }
 
-/// Start listening for `-s` signals sent to this process. The future
-/// resolves with the signal name.
+/// Start listening for `-s` signals sent to this process.
 #[cfg(windows)]
-pub fn listen_signals() -> io::Result<SignalFuture> {
+pub fn listen_signals() -> io::Result<Signals> {
     use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
     let pid = std::process::id();
@@ -210,32 +212,60 @@ pub fn listen_signals() -> io::Result<SignalFuture> {
         // Handles are plain kernel object ids; pass them as integers.
         handles.push(h as usize);
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let hs: Vec<HANDLE> = handles.iter().map(|&h| h as HANDLE).collect();
-        // SAFETY: the handles stay open for the life of the process.
-        let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, INFINITE) };
-        if let Some(&sig) = SIGNALS.get(r.wrapping_sub(WAIT_OBJECT_0) as usize) {
-            let _ = tx.send(sig);
+        loop {
+            // SAFETY: the handles stay open for the life of the process.
+            let r = unsafe { WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), 0, INFINITE) };
+            match SIGNALS.get(r.wrapping_sub(WAIT_OBJECT_0) as usize) {
+                Some(&sig) if tx.send(sig).is_ok() => {}
+                _ => break,
+            }
         }
     });
-    Ok(Box::pin(async move {
-        match rx.await {
-            Ok(sig) => sig,
-            Err(_) => std::future::pending().await,
-        }
-    }))
+    Ok(rx)
 }
 
 #[cfg(unix)]
-pub fn listen_signals() -> io::Result<SignalFuture> {
+pub fn listen_signals() -> io::Result<Signals> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut quit = signal(SignalKind::quit())?;
-    Ok(Box::pin(async move {
-        tokio::select! {
-            _ = term.recv() => "stop",
-            _ = quit.recv() => "quit",
+    let mut hup = signal(SignalKind::hangup())?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let sig = tokio::select! {
+                _ = term.recv() => "stop",
+                _ = quit.recv() => "quit",
+                _ = hup.recv() => "reload",
+            };
+            if tx.send(sig).is_err() {
+                break;
+            }
         }
-    }))
+    });
+    Ok(rx)
+}
+
+/// Open `url` in the default browser.
+pub fn open_browser(url: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (verb, file) = (wide("open"), wide(url));
+        // SAFETY: NUL-terminated strings that outlive the call.
+        let r = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        r as usize > 32
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener).arg(url).spawn().is_ok()
+    }
 }

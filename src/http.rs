@@ -31,11 +31,13 @@ pub struct HttpCtx {
 const MAX_HEADER: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-pub async fn accept_loop(l: TcpListener, ctx: Arc<HttpCtx>) {
+/// Serve connections with the current settings of `ctx` (replaced on
+/// configuration reload).
+pub async fn accept_loop(l: TcpListener, ctx: tokio::sync::watch::Receiver<Arc<HttpCtx>>) {
     loop {
         match l.accept().await {
             Ok((sock, addr)) => {
-                let ctx = ctx.clone();
+                let ctx = ctx.borrow().clone();
                 tokio::spawn(async move {
                     if let Err(e) = serve(sock, addr, &ctx).await {
                         debug!("http {addr}: {e}");

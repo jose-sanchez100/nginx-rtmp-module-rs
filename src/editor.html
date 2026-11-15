@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nginx.conf editor</title>
+<style>
+:root {
+  --bg: #f6f7f8; --panel: #ffffff; --text: #1d2124; --muted: #69727a; --line: #dfe3e6;
+  --accent: #00873e; --accent-text: #ffffff; --hover: #eef1f3; --sel: #e2f3e8;
+  --err: #c62828; --err-bg: #fdecea; --warn: #8a5a00; --warn-bg: #fff4dc; --ok-bg: #e5f5ea;
+  --input: #ffffff; --code: #f0f2f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181a; --panel: #1d2124; --text: #e4e7ea; --muted: #98a1a8; --line: #33393e;
+    --accent: #2fb565; --accent-text: #0b1a10; --hover: #262b2f; --sel: #1f3a2a;
+    --err: #ff7b72; --err-bg: #3a1d1d; --warn: #f0c060; --warn-bg: #3a2f14; --ok-bg: #1b3324;
+    --input: #15181a; --code: #262b2f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+header .path { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 120px; }
+.dirty::after { content: " ●"; color: var(--warn); }
+button, select, input { font: inherit; color: inherit; }
+button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+button:hover { background: var(--hover); }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.icon { padding: 2px 7px; font-size: 13px; line-height: 1.2; color: var(--muted); }
+button.icon:hover { color: var(--text); }
+button:disabled { opacity: .5; cursor: default; }
+.tabs { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.tabs button { border: 0; border-radius: 0; }
+.tabs button.on { background: var(--sel); font-weight: 600; }
+main { display: grid; grid-template-columns: 260px 1fr; gap: 0; min-height: calc(100vh - 100px); }
+nav { border-right: 1px solid var(--line); padding: 8px 0; background: var(--panel); overflow: auto; }
+nav .node { padding: 4px 10px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid transparent; }
+nav .node:hover { background: var(--hover); }
+nav .node.sel { background: var(--sel); border-left-color: var(--accent); font-weight: 600; }
+nav .node .kind { color: var(--muted); font-weight: normal; }
+section#pane { padding: 16px 20px 80px; overflow: auto; }
+.crumbs { color: var(--muted); margin-bottom: 4px; font-size: 12px; }
+h2 { margin: 0 0 4px; font-size: 18px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.help { color: var(--muted); margin: 0 0 12px; }
+.rows { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.row { display: grid; grid-template-columns: 210px 1fr auto; gap: 10px; align-items: start; padding: 8px 12px; border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; }
+.row:hover { background: var(--hover); }
+.row .name { font-family: ui-monospace, Consolas, monospace; font-weight: 600; padding-top: 4px; word-break: break-all; }
+.row .name small { display: block; font-family: system-ui, sans-serif; font-weight: normal; color: var(--muted); font-size: 11px; }
+.row .tools { display: flex; gap: 2px; white-space: nowrap; }
+.row.comment .name, .row.comment input { color: var(--muted); font-style: italic; }
+.row.blank { padding: 0 12px; min-height: 10px; grid-template-columns: 1fr auto; }
+.row.blank .tools { visibility: hidden; }
+.row.blank:hover .tools { visibility: visible; }
+.row.block .summary { padding-top: 4px; color: var(--muted); }
+.args { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.args input[type=text], .args select { background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 4px 7px; min-width: 70px; }
+.args input.wide { flex: 1; min-width: 240px; }
+.args input.bad { border-color: var(--err); background: var(--err-bg); }
+.args label.chk { display: inline-flex; gap: 3px; align-items: center; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; cursor: pointer; }
+.args .param { display: inline-flex; gap: 2px; align-items: center; }
+.argname { color: var(--muted); font-size: 11px; }
+.note { font-size: 11px; color: var(--muted); width: 100%; }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--code); color: var(--muted); font-weight: normal; }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.add { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.add select { background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; max-width: 360px; }
+.add .addhelp { color: var(--muted); flex-basis: 100%; }
+textarea#text { width: 100%; height: calc(100vh - 180px); font: 13px/1.45 ui-monospace, Consolas, monospace; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; tab-size: 4; }
+footer { position: fixed; bottom: 0; left: 0; right: 0; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 16px; font-size: 13px; max-height: 30vh; overflow: auto; }
+footer .msg { padding: 3px 8px; border-radius: 5px; margin: 2px 0; white-space: pre-wrap; }
+footer .msg.err { background: var(--err-bg); color: var(--err); }
+footer .msg.warn { background: var(--warn-bg); color: var(--warn); }
+footer .msg.ok { background: var(--ok-bg); }
+.hidden { display: none !important; }
+@media (max-width: 760px) {
+  main { grid-template-columns: 1fr; }
+  nav { border-right: 0; border-bottom: 1px solid var(--line); max-height: 30vh; }
+  .row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">nginx.conf</h1>
+  <span class="path" id="path"></span>
+  <div class="tabs"><button id="tab-form" class="on">Form</button><button id="tab-text">Text</button></div>
+  <button id="btn-revert" title="Discard changes and load the file again">Revert</button>
+  <button id="btn-reload" title="Reload the file as it is on disk into the running server">Reload server</button>
+  <button id="btn-save" class="primary" title="Check, save and reload the running server">Save &amp; reload</button>
+</header>
+<main id="form-view">
+  <nav id="tree"></nav>
+  <section id="pane"></section>
+</main>
+<div id="text-view" class="hidden" style="padding:12px 16px 80px"><textarea id="text" spellcheck="false"></textarea></div>
+<footer id="status"></footer>
+<script>
+"use strict";
+const base = location.pathname.replace(/\/?$/, "/");
+let schema = [], tree = [], hash = "", path = [], mode = "form", dirty = false, lastCheck = null;
+
+// ---------- helpers ----------
+const $ = (s) => document.querySelector(s);
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+}
+async function api(p, body) {
+  const r = await fetch(base + "api/" + p, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+  return { status: r.status, ...j };
+}
+// nginx-style argument quoting (same rules as the server)
+function quote(s) {
+  if (s !== "" && !/^["']/.test(s) && !/[\s{};#]/.test(s)) return s;
+  return '"' + s.replace(/["\\]/g, (c) => "\\" + c) + '"';
+}
+function splitArgs(s) {
+  const out = []; let i = 0;
+  while (i < s.length) {
+    if (/\s/.test(s[i])) { i++; continue; }
+    if (s[i] === '"' || s[i] === "'") {
+      const q = s[i++]; let w = "";
+      while (i < s.length && s[i] !== q) { if (s[i] === "\\" && i + 1 < s.length) i++; w += s[i++]; }
+      i++; out.push(w);
+    } else { let w = ""; while (i < s.length && !/\s/.test(s[i])) w += s[i++]; out.push(w); }
+  }
+  return out;
+}
+const joinArgs = (a) => a.map(quote).join(" ");
+
+// ---------- schema ----------
+const blockCtx = { main: { rtmp: "rtmp", http: "http" }, rtmp: { server: "server" }, server: { application: "application" }, application: { recorder: "recorder" }, http: { server: "http_server" }, http_server: { location: "location" } };
+function specFor(name, ctx) { return schema.find((s) => s.name === name && s.ctx.includes(ctx)); }
+function innerCtx(item, ctx) { return (blockCtx[ctx] || {})[item.name] || "other"; }
+function ctxOf(p) { let c = "main", items = tree; for (const i of p) { c = innerCtx(items[i], c); items = items[i].block; } return c; }
+function itemAt(p) { let items = tree, it = null; for (const i of p) { it = items[i]; items = it.block; } return it; }
+function itemsAt(p) { return p.length ? itemAt(p).block : tree; }
+const ctxLabel = { main: "Main", rtmp: "rtmp", server: "RTMP server", application: "Application", recorder: "Recorder", http: "http", http_server: "HTTP server", location: "Location", other: "Block" };
+
+function blockTitle(it, ctx) {
+  const inner = innerCtx(it, ctx);
+  if (inner === "server" || inner === "http_server") {
+    const ls = (it.block || []).filter((d) => d.t === "dir" && d.name === "listen").map((d) => d.args.join(" "));
+    return [it.name, ls.length ? ls.join(", ") : inner === "server" ? "1935" : "80"];
+  }
+  return [it.name, it.args.join(" ")];
+}
+
+// ---------- tree ----------
+function renderTree() {
+  const nav = $("#tree"); nav.textContent = "";
+  const walk = (items, p, ctx, depth) => {
+    items.forEach((it, i) => {
+      if (it.t !== "dir" || !it.block) return;
+      const q = p.concat(i), [n, a] = blockTitle(it, ctx);
+      const node = el("div", { class: "node" + (same(q, path) ? " sel" : ""), style: `padding-left:${10 + depth * 16}px`, onclick: () => select(q) }, n, " ", el("span", { class: "kind" }, a));
+      nav.append(node);
+      walk(it.block, q, innerCtx(it, ctx), depth + 1);
+    });
+  };
+  nav.append(el("div", { class: "node" + (path.length ? "" : " sel"), onclick: () => select([]) }, "nginx.conf ", el("span", { class: "kind" }, "main")));
+  walk(tree, [], "main", 1);
+}
+const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+function select(p) { path = p; renderTree(); renderPane(); }
+
+// ---------- pane ----------
+function renderPane() {
+  const pane = $("#pane"); pane.textContent = "";
+  const ctx = ctxOf(path), items = itemsAt(path), self = path.length ? itemAt(path) : null;
+  const parentCtx = path.length ? ctxOf(path.slice(0, -1)) : null;
+  const crumbs = ["nginx.conf"];
+  for (let k = 1; k <= path.length; k++) { const it = itemAt(path.slice(0, k)); crumbs.push(blockTitle(it, ctxOf(path.slice(0, k - 1))).join(" ").trim()); }
+  pane.append(el("div", { class: "crumbs" }, crumbs.join(" › ")));
+  const h = el("h2", {}, self ? self.name : "nginx.conf", el("span", { class: "badge" }, ctxLabel[ctx] || ctx));
+  pane.append(h);
+  if (self) {
+    const spec = specFor(self.name, parentCtx);
+    if (spec) {
+      pane.append(el("p", { class: "help" }, spec.help));
+      if (spec.args.length) {
+        const box = el("div", { class: "args", style: "margin-bottom:12px" });
+        argWidgets(box, self, spec);
+        pane.append(box);
+      }
+    } else if (self.args.length) {
+      pane.append(el("div", { class: "args", style: "margin-bottom:12px" }, genericArgs(self)));
+    }
+  } else {
+    pane.append(el("p", { class: "help" }, "Top level of the file. Open a block on the left, or add one below."));
+  }
+  const rows = el("div", { class: "rows" });
+  items.forEach((it, i) => rows.append(row(it, i, items, ctx)));
+  if (!items.length) rows.append(el("div", { class: "row" }, el("span", { class: "help" }, "Empty block."), el("span"), el("span")));
+  pane.append(rows);
+  pane.append(addBar(items, ctx));
+  if (self && ctx !== "main") {
+    pane.append(el("div", { class: "add" }, el("button", { onclick: () => { if (confirm(`Delete "${self.name} ${self.args.join(" ")}" and everything in it?`)) { itemsAt(path.slice(0, -1)).splice(path[path.length - 1], 1); changed(); select(path.slice(0, -1)); } } }, `Delete this ${self.name} block`)));
+  }
+}
+
+function tools(items, i, extra) {
+  const it = items[i];
+  return el("div", { class: "tools" },
+    extra || null,
+    el("button", { class: "icon", title: "Move up", disabled: i === 0, onclick: () => { items.splice(i - 1, 0, items.splice(i, 1)[0]); changed(); renderAll(); } }, "↑"),
+    el("button", { class: "icon", title: "Move down", disabled: i === items.length - 1, onclick: () => { items.splice(i + 1, 0, items.splice(i, 1)[0]); changed(); renderAll(); } }, "↓"),
+    el("button", { class: "icon", title: "Delete", onclick: () => {
+      if (it.t === "dir" && it.block && !confirm(`Delete "${it.name} ${it.args.join(" ")}" and everything in it?`)) return;
+      items.splice(i, 1); changed(); renderAll(); } }, "✕"));
+}
+
+function row(it, i, items, ctx) {
+  if (it.t === "blank") return el("div", { class: "row blank", title: "Empty line" }, el("span"), tools(items, i));
+  if (it.t === "comment") {
+    const m = it.text.match(/^\s*([a-z_][a-z0-9_]*)\b(.*);\s*$/);
+    const enable = m ? el("button", { class: "icon", title: "Enable this directive", onclick: () => {
+      const words = splitArgs(it.text.replace(/;\s*$/, ""));
+      items[i] = { t: "dir", name: words[0], args: words.slice(1), line: 0 }; changed(); renderAll(); } }, "▶") : null;
+    const inp = el("input", { type: "text", class: "wide", value: it.text, oninput: (e) => { it.text = e.target.value; changed(); } });
+    return el("div", { class: "row comment" }, el("div", { class: "name" }, "#", el("small", {}, m ? "disabled directive" : "comment")), el("div", { class: "args" }, inp), tools(items, i, enable));
+  }
+  const spec = specFor(it.name, ctx);
+  if (it.block) {
+    const inner = innerCtx(it, ctx), n = it.block.filter((d) => d.t === "dir").length;
+    const q = path.concat(i);
+    return el("div", { class: "row block" },
+      el("div", { class: "name" }, it.name + " " + it.args.join(" "), el("small", {}, ctxLabel[inner] || "block")),
+      el("div", { class: "summary" }, `${n} directive${n === 1 ? "" : "s"} `, el("button", { onclick: () => select(q) }, "Open")),
+      tools(items, i));
+  }
+  const nameCell = el("div", { class: "name", title: spec ? spec.help + (spec.default ? `\nDefault: ${spec.default}` : "") : "Not used by this server (kept in the file)" },
+    it.name, el("small", {}, spec ? spec.module : "unknown"));
+  const box = el("div", { class: "args" });
+  if (spec) argWidgets(box, it, spec);
+  else { box.append(genericArgs(it)); box.append(el("span", { class: "badge warn" }, "not used by this server")); }
+  if (spec) box.append(el("div", { class: "note" }, spec.help + (spec.default ? ` Default: ${spec.default}.` : "")));
+  const disable = el("button", { class: "icon", title: "Disable (comment out)", onclick: () => {
+    items[i] = { t: "comment", text: " " + joinArgs([it.name, ...it.args]) + ";" }; changed(); renderAll(); } }, "#");
+  return el("div", { class: "row" }, nameCell, box, tools(items, i, disable));
+}
+
+function edited(it) { delete it.raw; changed(); }
+
+function genericArgs(it) {
+  return el("input", { type: "text", class: "wide", value: joinArgs(it.args), placeholder: "arguments", oninput: (e) => { it.args = splitArgs(e.target.value); edited(it); } });
+}
+
+const patterns = {
+  time: /^(\d+(ms|s|m|h|d|w|M|y)?)+$/, size: /^\d+[kKmMgG]?$/, int: /^\d+$/,
+  addr: /^(\d+|[^\s:]+:\d+|\*:\d+|\[[0-9a-fA-F:.]+\]:\d+)$/,
+};
+const placeholders = { time: "e.g. 30s", size: "e.g. 4096 or 1m", int: "number", addr: "port or ip:port", url: "url", path: "path", text: "" };
+
+// Spread the directive's arguments over the schema's arguments.
+function assign(spec, args) {
+  const out = []; let k = 0;
+  const required = (from) => spec.args.slice(from).filter((a) => !a.opt).length;
+  spec.args.forEach((a, n) => {
+    if (a.rep) { out.push(args.slice(k)); k = args.length; return; }
+    if (a.kind.type === "choices") {
+      const vals = []; while (k < args.length && args.length - k > required(n + 1)) vals.push(args[k++]);
+      out.push(vals); return;
+    }
+    const left = args.length - k;
+    if (a.opt) {
+      const fits = left > required(n + 1) && (a.kind.type !== "choice" || a.kind.values.includes(args[k]));
+      out.push(fits ? args[k++] : ""); return;
+    }
+    out.push(k < args.length ? args[k++] : "");
+  });
+  if (k < args.length) out[out.length - 1] = [].concat(out[out.length - 1], args.slice(k));
+  return out;
+}
+function rebuild(spec, vals) {
+  const args = [];
+  spec.args.forEach((a, n) => {
+    const v = vals[n];
+    if (Array.isArray(v)) args.push(...v.filter((x) => x !== ""));
+    else if (v !== "" || !a.opt) args.push(v);
+  });
+  return args;
+}
+
+function argWidgets(box, it, spec) {
+  const vals = assign(spec, it.args);
+  const update = () => { it.args = rebuild(spec, vals); edited(it); };
+  spec.args.forEach((a, n) => {
+    const t = a.kind.type;
+    const lab = el("span", { class: "argname" }, a.name + (a.opt ? "?" : ""));
+    if (t === "flag" || t === "choice") {
+      const opts = t === "flag" ? ["on", "off"] : a.kind.values;
+      const sel = el("select", { title: a.name, onchange: (e) => { vals[n] = e.target.value; update(); } });
+      if (a.opt) sel.append(el("option", { value: "" }, "—"));
+      const cur = vals[n];
+      if (cur !== "" && !opts.includes(cur)) sel.append(el("option", { value: cur }, cur));
+      for (const o of opts) sel.append(el("option", { value: o }, o));
+      sel.value = cur;
+      box.append(lab, sel);
+    } else if (t === "choices") {
+      const cur = new Set(vals[n]);
+      box.append(lab);
+      const extra = vals[n].filter((v) => !a.kind.values.includes(v));
+      for (const o of a.kind.values.concat(extra)) {
+        const cb = el("input", { type: "checkbox", checked: cur.has(o), onchange: (e) => {
+          if (e.target.checked) cur.add(o); else cur.delete(o);
+          vals[n] = a.kind.values.concat(extra).filter((v) => cur.has(v)); update(); } });
+        box.append(el("label", { class: "chk" }, cb, o));
+      }
+    } else if (t === "param") {
+      box.append(lab);
+      const list = el("span", { class: "args" });
+      const draw = () => {
+        list.textContent = "";
+        vals[n].forEach((kv, j) => {
+          const [key, ...rest] = kv.split("="); const val = rest.join("=");
+          const ks = el("select", { onchange: (e) => { vals[n][j] = e.target.value + "=" + val; update(); draw(); } });
+          const keys = a.kind.values.includes(key) ? a.kind.values : [key].concat(a.kind.values);
+          for (const o of keys) ks.append(el("option", { value: o }, o));
+          ks.value = key;
+          const vi = el("input", { type: "text", value: val, size: 12, oninput: (e) => { vals[n][j] = key + "=" + e.target.value; update(); } });
+          list.append(el("span", { class: "param" }, ks, "=", vi, el("button", { class: "icon", title: "Remove", onclick: () => { vals[n].splice(j, 1); update(); draw(); } }, "✕")));
+        });
+        list.append(el("button", { class: "icon", title: "Add parameter", onclick: () => { vals[n].push(a.kind.values[0] + "="); update(); draw(); } }, "+ param"));
+      };
+      draw(); box.append(list);
+    } else if (a.rep) {
+      box.append(lab, el("input", { type: "text", class: "wide", value: joinArgs(vals[n]), placeholder: a.name, oninput: (e) => { vals[n] = splitArgs(e.target.value); update(); } }));
+    } else {
+      const pat = patterns[t];
+      const wide = ["url", "path", "text"].includes(t);
+      const inp = el("input", { type: "text", class: wide ? "wide" : "", value: vals[n], placeholder: placeholders[t] || a.name, title: a.name,
+        oninput: (e) => { vals[n] = e.target.value; e.target.classList.toggle("bad", !!pat && e.target.value !== "" && !pat.test(e.target.value)); update(); } });
+      if (pat && vals[n] !== "" && !pat.test(vals[n])) inp.classList.add("bad");
+      box.append(lab, inp);
+    }
+  });
+}
+
+function addBar(items, ctx) {
+  const present = new Set(items.filter((d) => d.t === "dir").map((d) => d.name));
+  const avail = schema.filter((s) => s.ctx.includes(ctx) && (s.multi || !present.has(s.name)));
+  const sel = el("select", {});
+  sel.append(el("option", { value: "" }, avail.length ? "Add a directive…" : "Add a directive (name)…"));
+  const groups = {};
+  for (const s of avail) (groups[s.module] = groups[s.module] || []).push(s);
+  for (const [m, list] of Object.entries(groups)) {
+    const g = el("optgroup", { label: m });
+    for (const s of list) g.append(el("option", { value: s.name }, s.name + (s.block ? " { }" : "")));
+    sel.append(g);
+  }
+  const help = el("span", { class: "addhelp" });
+  sel.onchange = () => { const s = specFor(sel.value, ctx); help.textContent = s ? s.help + (s.default ? ` Default: ${s.default}.` : "") : ""; };
+  const add = () => {
+    const s = specFor(sel.value, ctx); if (!s) return;
+    const args = [];
+    for (const a of s.args) {
+      if (a.opt) continue;
+      const t = a.kind.type;
+      if (t === "flag") args.push(s.default === "on" ? "off" : "on");
+      else if (t === "choice" || t === "choices") args.push(s.default && a.kind.values.includes(s.default) ? s.default : a.kind.values[0]);
+      else if (t === "addr") args.push(s.default || "");
+      else args.push("");
+    }
+    const it = { t: "dir", name: s.name, args, line: 0 };
+    if (s.block) it.block = [];
+    // after the last directive of the same name, else at the end
+    let at = items.length; for (let k = items.length - 1; k >= 0; k--) if (items[k].t === "dir" && items[k].name === s.name) { at = k + 1; break; }
+    items.splice(at, 0, it); changed();
+    if (s.block && !s.args.some((a) => !a.opt)) { select(path.concat(at)); return; }
+    renderAll();
+  };
+  const custom = el("input", { type: "text", placeholder: "or type: name args", size: 22, onkeydown: (e) => {
+    if (e.key !== "Enter" || !e.target.value.trim()) return;
+    const w = splitArgs(e.target.value.trim().replace(/;$/, ""));
+    items.push({ t: "dir", name: w[0], args: w.slice(1), line: 0 }); changed(); renderAll(); } });
+  return el("div", { class: "add" }, sel, el("button", { onclick: add }, "Add"),
+    el("button", { onclick: () => { items.push({ t: "comment", text: " " }); changed(); renderAll(); } }, "Add comment"),
+    custom, help);
+}
+
+// ---------- status / checking ----------
+function status(msgs) {
+  const f = $("#status"); f.textContent = "";
+  for (const [cls, text] of msgs) f.append(el("div", { class: "msg " + cls }, text));
+}
+function showCheck(c, extra) {
+  const msgs = extra ? [extra] : [];
+  if (!c) { status(msgs); return; }
+  if (!c.ok) msgs.push(["err", c.error]);
+  for (const w of c.warnings || []) msgs.push(["warn", w]);
+  if (c.ok && !(c.warnings || []).length && !extra) msgs.push(["ok", dirty ? "Configuration is valid (not saved yet)." : "Configuration is valid."]);
+  status(msgs);
+}
+let checkTimer = null;
+function changed() {
+  dirty = true; $("#title").classList.add("dirty");
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(async () => { const r = await api("render", { tree }); if (r.check) { lastCheck = r.check; showCheck(r.check); } }, 400);
+}
+function renderAll() { renderTree(); renderPane(); }
+
+// ---------- load / save ----------
+async function load() {
+  const r = await api("load");
+  if (r.error) { status([["err", r.error]]); return; }
+  $("#path").textContent = r.path; document.title = "nginx.conf editor — " + r.path;
+  hash = r.hash; dirty = false; $("#title").classList.remove("dirty");
+  $("#text").value = r.text;
+  if (r.parse_error) { setMode("text", true); status([["err", "The file cannot be shown as a form: " + r.parse_error]]); return; }
+  tree = r.tree; lastCheck = r.check;
+  try { if (path.length && !itemAt(path).block) path = []; } catch { path = []; }
+  renderAll(); showCheck(r.check);
+}
+async function setMode(m, force) {
+  if (m === mode && !force) return;
+  if (m === "text" && !force) { const r = await api("render", { tree }); if (r.text !== undefined) $("#text").value = r.text; }
+  if (m === "form" && !force) {
+    const r = await api("parse", { text: $("#text").value });
+    if (r.error) { status([["err", "Fix the text first: " + r.error]]); return; }
+    tree = r.tree;
+    try { if (path.length && !itemAt(path).block) path = []; } catch { path = []; }
+    renderAll(); showCheck(r.check);
+  }
+  mode = m;
+  $("#form-view").classList.toggle("hidden", m !== "form");
+  $("#text-view").classList.toggle("hidden", m !== "text");
+  $("#tab-form").classList.toggle("on", m === "form");
+  $("#tab-text").classList.toggle("on", m === "text");
+}
+async function save(force) {
+  const body = mode === "text" ? { text: $("#text").value, hash, force } : { tree, hash, force };
+  $("#btn-save").disabled = true;
+  const r = await api("save", body).finally(() => { $("#btn-save").disabled = false; });
+  if (r.status === 409) {
+    if (confirm("nginx.conf was changed by another program since it was loaded. Overwrite it?")) return save(true);
+    return;
+  }
+  if (r.error) { status([["err", r.error]]); return; }
+  hash = r.hash;
+  await load();
+  showCheck(lastCheck, r.reload.ok ? ["ok", "Saved. " + r.reload.message] : ["err", "Saved, but the server was not reloaded: " + r.reload.message]);
+}
+
+$("#tab-form").onclick = () => setMode("form");
+$("#tab-text").onclick = () => setMode("text");
+$("#text").addEventListener("input", () => { dirty = true; $("#title").classList.add("dirty"); });
+$("#text").addEventListener("keydown", (e) => {
+  if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("    ", s, t.selectionEnd, "end"); }
+});
+$("#btn-save").onclick = () => save(false);
+$("#btn-revert").onclick = () => { if (!dirty || confirm("Discard your changes?")) { setMode("form", true); load(); } };
+$("#btn-reload").onclick = async () => {
+  if (dirty && !confirm("Your changes are not saved; reload the server with the file as it is on disk?")) return;
+  const r = await api("reload", {});
+  showCheck(lastCheck, r.ok ? ["ok", r.message] : ["err", r.message || r.error]);
+};
+document.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); save(false); } });
+window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+(async () => {
+  const s = await api("schema");
+  schema = Array.isArray(s) ? s : Object.values(s).filter((v) => v && v.name);
+  await load();
+})();
+</script>
+</body>
+</html>

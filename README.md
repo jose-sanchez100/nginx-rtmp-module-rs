@@ -22,8 +22,11 @@ This is not an nginx module and does not need nginx: it runs on
 - RTMPS, which nginx-rtmp lacks: `rtmps://` relays (e.g. Facebook, YouTube) and
   `listen PORT ssl;`.
 - Enhanced RTMP codecs (HEVC, AV1, VP9) are forwarded.
+- Configuration editor in the browser (`nginx -e` or the tray menu) with a form for
+  every supported directive; saving reloads the running server without dropping
+  connections (`-s reload` works too).
 - On Windows: runs without a console like nginx, error log, pid file,
-  `-s stop|quit`, and a tray icon listing streams and connections.
+  `-s stop|quit|reload`, and a tray icon listing streams and connections.
 
 Not ported yet: HLS, DASH, VOD (`play /path`), `max_connections`,
 `proxy_protocol`. See [PORTING.md](PORTING.md) for the status of every C file
@@ -40,8 +43,11 @@ The binary is `target/release/nginx` (`nginx.exe` on Windows).
 ## Run
 
 ```bash
-nginx [-p prefix] [-c nginx.conf] [-t] [-s stop|quit]
+nginx [-p prefix] [-c nginx.conf] [-t] [-e] [-s stop|quit|reload]
 ```
+
+`-e` opens the configuration editor in the browser; `-s reload` applies a changed
+`nginx.conf` to the running server, keeping current connections.
 
 The prefix defaults to the executable's directory and the configuration to
 `PREFIX/conf/nginx.conf`, so the binary can be dropped into an nginx folder and

@@ -4,11 +4,21 @@ mod tray;
 
 use nginx_rtmp::access_log::resolve_path;
 use nginx_rtmp::config::Config;
-use nginx_rtmp::server::Server;
-use std::path::PathBuf;
+use nginx_rtmp::editor;
+use nginx_rtmp::server::{Reloader, Server};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
-const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-s stop|quit]
+/// Requests from the tray icon.
+#[derive(Clone, Copy)]
+pub enum TrayCmd {
+    Stop,
+    Reload,
+    Configure,
+}
+
+const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-e] [-s stop|quit|reload]
 
   -p DIR    prefix: relative paths in the configuration (logs, pid) are
             resolved against it; default: the directory of the executable
@@ -16,7 +26,9 @@ const USAGE: &str = "usage: nginx [-p prefix] [-c nginx.conf] [-t] [-s stop|quit
             default: PREFIX/conf/nginx.conf, or conf/nginx.conf in the
             working directory when -p is not given and that file is missing
   -t        test configuration and exit
-  -s SIGNAL send a signal to the running server: stop, quit
+  -e        edit the configuration in the browser; saving reloads the
+            running server (the tray icon's Configure does the same)
+  -s SIGNAL send a signal to the running server: stop, quit, reload
 
 Errors go to the error log (error_log, default PREFIX/logs/error.log).
 Console output, when started from a terminal, is controlled by RUST_LOG
@@ -30,6 +42,7 @@ async fn main() -> ExitCode {
     let mut conf_arg: Option<PathBuf> = None;
     let mut prefix_arg: Option<PathBuf> = None;
     let mut test_only = false;
+    let mut edit = false;
     let mut signal: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -49,6 +62,7 @@ async fn main() -> ExitCode {
                 }
             },
             "-t" => test_only = true,
+            "-e" => edit = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -60,7 +74,7 @@ async fn main() -> ExitCode {
             }
         }
     }
-    let serve = !test_only && signal.is_none();
+    let serve = !test_only && !edit && signal.is_none();
 
     // Started by double-click: drop the console, like nginx. Everything
     // then goes to the error log.
@@ -83,11 +97,17 @@ async fn main() -> ExitCode {
             tracing::warn!("{e}");
         }
     }
+    if edit {
+        return edit_standalone(prefix, conf_path).await;
+    }
     let mut config = match Config::load(&conf_path) {
         Ok(c) => c,
         Err(e) => return fail(e.to_string()),
     };
     config.prefix = Some(prefix.clone());
+    for w in &config.warnings {
+        tracing::warn!("{w}");
+    }
     let pid_path = resolve_path(Some(&prefix), config.pid.as_deref().unwrap_or(DEFAULT_PID));
 
     if let Some(sig) = signal {
@@ -121,29 +141,80 @@ async fn main() -> ExitCode {
     if let Err(e) = daemon::write_pid(&pid_path) {
         return fail(e.to_string());
     }
-    let signals = match daemon::listen_signals() {
+    let mut signals = match daemon::listen_signals() {
         Ok(s) => s,
         Err(e) => return fail(format!("signals: {e}")),
     };
-    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let log = Arc::new(log);
+    let reload: editor::Apply = {
+        let (reloader, conf_path, prefix, log) = (server.reloader(), conf_path.clone(), prefix.clone(), log.clone());
+        Arc::new(move || {
+            let (reloader, conf_path, prefix, log) = (reloader.clone(), conf_path.clone(), prefix.clone(), log.clone());
+            Box::pin(async move { reload_config(&reloader, &conf_path, &prefix, &log).await })
+        })
+    };
+    let (tray_tx, mut tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayCmd>();
+    #[cfg(windows)]
+    let toasts = Arc::new(std::sync::Mutex::new(Vec::new()));
     #[cfg(windows)]
     let tray = tray::start(tray::TrayOptions {
         registry: server.registry.clone(),
-        listen: server.listen_info(),
+        listen: server.listen_info_shared(),
         conf_path: conf_path.clone(),
         logs_dir: prefix.join("logs"),
-        stop: stop.clone(),
+        commands: tray_tx,
+        toasts: toasts.clone(),
     });
     #[cfg(windows)]
     if tray.is_none() {
         tracing::warn!("could not create the tray icon");
     }
-    tokio::select! {
-        _ = server.run() => {}
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-        sig = signals => tracing::info!("signal {sig} received, exiting"),
-        _ = stop.notified() => tracing::info!("stopped from the tray icon"),
+    #[cfg(not(windows))]
+    drop(tray_tx);
+    let mut editor: Option<editor::Running> = None;
+    // A task of its own: reloads are applied by it while this loop waits
+    // for their outcome.
+    let mut run = tokio::spawn(server.run());
+    loop {
+        tokio::select! {
+            _ = &mut run => break,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down");
+                break;
+            }
+            Some(sig) = signals.recv() => {
+                if sig != "reload" {
+                    tracing::info!("signal {sig} received, exiting");
+                    break;
+                }
+                tracing::info!("signal reload received");
+                // failures are in the error log already
+                let _ = reload().await;
+            }
+            Some(cmd) = tray_rx.recv() => {
+                let toast = match cmd {
+                    TrayCmd::Stop => {
+                        tracing::info!("stopped from the tray icon");
+                        break;
+                    }
+                    TrayCmd::Reload => match reload().await {
+                        Ok(m) => ("Configuration reloaded".to_string(), m),
+                        Err(e) => ("Reload failed".to_string(), e),
+                    },
+                    TrayCmd::Configure => match open_editor(&mut editor, &conf_path, reload.clone()).await {
+                        Ok(()) => continue,
+                        Err(e) => ("Could not open the editor".to_string(), e),
+                    },
+                };
+                #[cfg(windows)]
+                toasts.lock().unwrap().push(toast);
+                #[cfg(not(windows))]
+                let _ = toast;
+            }
+        }
     }
+    drop(editor);
+    run.abort();
     #[cfg(windows)]
     drop(tray);
     let _ = std::fs::remove_file(&pid_path);
@@ -172,4 +243,69 @@ fn locate(prefix_arg: Option<PathBuf>, conf_arg: Option<PathBuf>) -> (PathBuf, P
             }
         }
     }
+}
+
+/// Read the configuration again and apply it to the running server.
+async fn reload_config(reloader: &Reloader, conf_path: &Path, prefix: &Path, log: &daemon::LogHandle) -> Result<String, String> {
+    let mut config = Config::load(conf_path).map_err(|e| {
+        tracing::error!("reload failed, keeping the running configuration: {e}");
+        format!("reload failed: {e}")
+    })?;
+    config.prefix = Some(prefix.to_path_buf());
+    for w in &config.warnings {
+        tracing::warn!("{w}");
+    }
+    let (path, level) = match &config.error_log {
+        Some(el) => (resolve_path(Some(prefix), &el.path), el.level.clone()),
+        None => (prefix.join(DEFAULT_ERROR_LOG), "error".to_string()),
+    };
+    reloader.reload(config).await.map_err(|e| format!("reload failed: {e}"))?;
+    if let Err(e) = log.open(&path, &level) {
+        tracing::warn!("{e}");
+    }
+    Ok("The running server uses the new configuration.".into())
+}
+
+/// Start the editor once and open it in the browser.
+async fn open_editor(editor: &mut Option<editor::Running>, conf_path: &Path, apply: editor::Apply) -> Result<(), String> {
+    if editor.is_none() {
+        let e = editor::start(conf_path.to_path_buf(), 0, apply).await.map_err(|e| format!("editor: {e}"))?;
+        *editor = Some(e);
+    }
+    let url = &editor.as_ref().expect("started above").url;
+    if !daemon::open_browser(url) {
+        return Err(format!("open {url} in a browser"));
+    }
+    Ok(())
+}
+
+/// `-e`: edit the configuration without starting a server; saving sends
+/// `reload` to the running one, if any.
+async fn edit_standalone(prefix: PathBuf, conf_path: PathBuf) -> ExitCode {
+    let pid_path = {
+        let pid = Config::load(&conf_path).ok().and_then(|c| c.pid);
+        resolve_path(Some(&prefix), pid.as_deref().unwrap_or(DEFAULT_PID))
+    };
+    let apply: editor::Apply = Arc::new(move || {
+        let pid_path = pid_path.clone();
+        Box::pin(async move {
+            match daemon::read_pid(&pid_path) {
+                Err(_) => Ok("No running server to reload; it will use the new configuration when started.".into()),
+                Ok(pid) => daemon::send_signal("reload", pid)
+                    .map(|()| format!("Reload signal sent to the server (PID {pid}); problems go to its error log.")),
+            }
+        })
+    });
+    let running = match editor::start(conf_path.clone(), 0, apply).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("nginx: editor: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("nginx: editing {}", conf_path.display());
+    println!("nginx: open {} (Ctrl+C to quit)", running.url);
+    daemon::open_browser(&running.url);
+    let _ = tokio::signal::ctrl_c().await;
+    ExitCode::SUCCESS
 }

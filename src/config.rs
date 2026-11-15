@@ -412,6 +412,9 @@ pub struct Config {
     pub exec: crate::exec::MainExec,
     /// `server {}` blocks of the `http {}` block.
     pub http: Vec<HttpServerConf>,
+    /// Ignored directives and options (`file:line: message`); the caller
+    /// decides where they go.
+    pub warnings: Vec<String>,
 }
 
 /// One level of an `http {}` server: the server itself or a `location`.
@@ -618,10 +621,16 @@ impl Config {
                 cx.http_block(block, &mut http)?;
             }
         }
-        for w in cx.warnings {
-            tracing::warn!("{w}");
-        }
-        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid, exec: cx.exec, http })
+        Ok(Config {
+            servers,
+            log_formats: cx.formats,
+            prefix: None,
+            error_log,
+            pid,
+            exec: cx.exec,
+            http,
+            warnings: cx.warnings,
+        })
     }
 }
 

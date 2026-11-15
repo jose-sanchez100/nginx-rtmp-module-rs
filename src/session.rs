@@ -42,7 +42,7 @@ pub struct ServerCtx {
     /// Global exec settings (`exec_static`, `respawn_timeout`, ...).
     pub exec: Arc<crate::exec::MainExec>,
     /// Running `exec_pull` children.
-    pub exec_pulls: crate::exec::PullTable,
+    pub exec_pulls: Arc<crate::exec::PullTable>,
 }
 
 impl ServerCtx {
