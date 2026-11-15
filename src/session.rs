@@ -12,7 +12,7 @@
 use crate::amf::{self, Amf0};
 use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
-use crate::config::{AccessAction, AccessScope, AppConf, RelayTarget, ServerConf};
+use crate::config::{AccessAction, AccessScope, AppConf, MetaMode, RelayTarget, ServerConf};
 use crate::handshake;
 use crate::live::{LiveError, Peer, Registry, SessionId, StreamRef};
 use crate::message::{self as msg, *};
@@ -353,8 +353,8 @@ impl Session {
             MSG_BANDWIDTH => {}
             MSG_USER => self.handle_user(&m.payload)?,
             MSG_AUDIO | MSG_VIDEO => self.handle_av(m.type_id, m.timestamp, m.payload),
-            MSG_AMF_META => return self.handle_data(&m.payload),
-            MSG_AMF3_META => return self.handle_data(m.payload.get(1..).unwrap_or_default()),
+            MSG_AMF_META => return self.handle_data(&m.payload, m.timestamp),
+            MSG_AMF3_META => return self.handle_data(m.payload.get(1..).unwrap_or_default(), m.timestamp),
             MSG_AMF_CMD => return self.handle_cmd(&m.payload).await,
             MSG_AMF3_CMD => return self.handle_cmd(m.payload.get(1..).unwrap_or_default()).await,
             MSG_AGGREGATE => return self.handle_aggregate(m),
@@ -394,8 +394,8 @@ impl Session {
                     self.handle_av(sub.type_id, sub.timestamp, sub.payload);
                     Flow::Continue
                 }
-                MSG_AMF_META => self.handle_data(&sub.payload)?,
-                MSG_AMF3_META => self.handle_data(sub.payload.get(1..).unwrap_or_default())?,
+                MSG_AMF_META => self.handle_data(&sub.payload, sub.timestamp)?,
+                MSG_AMF3_META => self.handle_data(sub.payload.get(1..).unwrap_or_default(), sub.timestamp)?,
                 t => {
                     debug!("unexpected message type {t} in aggregate");
                     Flow::Continue
@@ -417,7 +417,7 @@ impl Session {
         j.stream.lock().unwrap().on_av(type_id, ts, payload);
     }
 
-    fn handle_data(&mut self, payload: &[u8]) -> Result<Flow> {
+    fn handle_data(&mut self, payload: &[u8], timestamp: u32) -> Result<Flow> {
         let values = match amf::decode_all(payload) {
             Ok(v) => v,
             Err(e) => {
@@ -433,7 +433,13 @@ impl Session {
         }
         if let Some((payload, info)) = codec::process_metadata(&values, app.meta) {
             debug!("metadata: {info:?}");
-            j.stream.lock().unwrap().set_meta(payload, info);
+            // nginx sends rebuilt metadata at timestamp 0 and copied metadata
+            // at the publisher's timestamp (ngx_rtmp_codec_prepare_meta).
+            // Players built on libavformat only treat onMetaData at dts 0 as
+            // metadata; anything later becomes an extra data stream that
+            // stalls stream probing (VLC starts seconds late and stutters).
+            let ts = if app.meta == MetaMode::Copy { timestamp } else { 0 };
+            j.stream.lock().unwrap().set_meta(payload, info, ts);
         }
         Ok(Flow::Continue)
     }

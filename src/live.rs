@@ -84,6 +84,8 @@ pub struct Stream {
     aac_header: Option<Bytes>,
     avc_header: Option<Bytes>,
     meta: Option<Bytes>,
+    /// Timestamp the metadata is sent with.
+    meta_ts: u32,
     meta_version: u32,
     pub meta_info: codec::MetaInfo,
     pub stats: StreamStats,
@@ -125,6 +127,7 @@ impl Registry {
                     aac_header: None,
                     avc_header: None,
                     meta: None,
+                    meta_ts: 0,
                     meta_version: 0,
                     meta_info: Default::default(),
                     stats: Default::default(),
@@ -309,10 +312,11 @@ impl Stream {
     }
 
     /// Store metadata to be (re)sent to every player before its next frame.
-    pub fn set_meta(&mut self, payload: Option<Bytes>, info: codec::MetaInfo) {
+    pub fn set_meta(&mut self, payload: Option<Bytes>, info: codec::MetaInfo, timestamp: u32) {
         self.meta_info = info;
         if let Some(p) = payload {
             self.meta = Some(p);
+            self.meta_ts = timestamp;
             self.meta_version = self.meta_version.wrapping_add(1).max(1);
         }
     }
@@ -364,7 +368,7 @@ impl Stream {
                 && p.meta_version != self.meta_version {
                     let m = Message {
                         csid: msg::CSID_AMF,
-                        timestamp,
+                        timestamp: self.meta_ts,
                         type_id: msg::MSG_AMF_META,
                         msid: MSID,
                         payload: meta.clone(),

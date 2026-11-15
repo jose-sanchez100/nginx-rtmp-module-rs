@@ -18,7 +18,7 @@
 use crate::amf::{self, Amf0};
 use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
-use crate::config::{AppConf, RelayTarget, ServerConf};
+use crate::config::{AppConf, MetaMode, RelayTarget, ServerConf};
 use crate::handshake;
 use crate::live::{Peer, StreamRef};
 use crate::message::{self as msg, *};
@@ -550,7 +550,8 @@ fn on_pulled(app: &AppConf, stream: &StreamRef, m: Message) -> Result<()> {
             let body = if m.type_id == MSG_AMF3_META { m.payload.get(1..).unwrap_or_default() } else { &m.payload[..] };
             if let Ok(v) = amf::decode_all(body)
                 && let Some((payload, info)) = codec::process_metadata(&v, app.meta) {
-                    stream.lock().unwrap().set_meta(payload, info);
+                    let ts = if app.meta == MetaMode::Copy { m.timestamp } else { 0 };
+                    stream.lock().unwrap().set_meta(payload, info, ts);
                 }
         }
         MSG_AMF_CMD => {

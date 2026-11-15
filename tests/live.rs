@@ -20,6 +20,10 @@ rtmp {
             meta copy;
             allow publish all;
         }
+        application rebuilt {
+            live on;
+            meta on;
+        }
         application closed {
             live on;
             deny publish all;
@@ -131,5 +135,40 @@ async fn unknown_app_and_access_denied_close() {
     c.send(amf_cmd(8, 1, &[Amf0::str("publish"), Amf0::Number(3.0), Amf0::Null, Amf0::str("x"), Amf0::str("live")])).await;
     while let Some(m) = c.recv().await {
         assert_ne!(m.type_id, MSG_AMF_CMD, "no status expected on access deny");
+    }
+}
+
+/// Metadata reaches players at timestamp 0 when rebuilt (`meta on`) and at
+/// the publisher's timestamp when copied, as in nginx. libavformat (VLC,
+/// ffplay) only takes onMetaData at dts 0 as metadata; a later timestamp
+/// turns it into an extra data stream that stalls probing.
+#[tokio::test]
+async fn metadata_timestamp() {
+    let addr = start().await;
+    for (app, want) in [("rebuilt", 0), ("live", 500)] {
+        let mut publ = Client::ready(addr, app).await;
+        publ.publish("m").await;
+        assert_eq!(publ.expect_status().await, "NetStream.Publish.Start");
+        let mut meta = amf_data(4, 1, &[
+            Amf0::str("@setDataFrame"),
+            Amf0::str("onMetaData"),
+            Amf0::EcmaArray(vec![("width".into(), Amf0::Number(640.0))]),
+        ]);
+        meta.timestamp = 500;
+        publ.send(meta).await;
+        publ.send(av(MSG_VIDEO, 900, &[0x17, 0x00, 0, 0, 0, 0xAA])).await;
+
+        let mut play = Client::ready(addr, app).await;
+        play.play("m").await;
+        assert_eq!(play.expect_status().await, "NetStream.Play.Start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publ.send(av(MSG_VIDEO, 1000, &[0x17, 0x01, 0, 0, 0, 3])).await;
+        let m = loop {
+            let m = play.recv().await.expect("player closed");
+            if m.type_id == MSG_AMF_META && m.payload.windows(10).any(|w| w == b"onMetaData") {
+                break m;
+            }
+        };
+        assert_eq!(m.timestamp, want, "app {app}");
     }
 }
