@@ -8,11 +8,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// A bound server, ready to accept connections.
 pub struct Server {
     listeners: Vec<(TcpListener, Arc<ServerCtx>, Option<TlsAcceptor>)>,
+    /// `http {}` servers with `rtmp_stat` / `rtmp_control`.
+    http: Vec<(TcpListener, Arc<crate::http::HttpCtx>)>,
     pub registry: Arc<Registry>,
     exec: Arc<crate::exec::MainExec>,
 }
@@ -25,6 +27,7 @@ impl Server {
         let mut seen = HashSet::new();
         let prefix = config.prefix.clone();
         let exec = Arc::new(crate::exec::MainExec { prefix: prefix.clone(), ..config.exec.clone() });
+        let mut ctxs = Vec::new();
         for (index, srv) in config.servers.into_iter().enumerate() {
             let addrs = srv.listen.clone();
             let acceptor = match (&srv.ssl_certificate, &srv.ssl_certificate_key) {
@@ -38,6 +41,7 @@ impl Server {
             let mut ctx = ServerCtx::new(index, srv, registry.clone());
             ctx.exec = exec.clone();
             let ctx = Arc::new(ctx);
+            ctxs.push(ctx.clone());
             for (addr, ssl) in addrs.into_iter().zip(ssl) {
                 // Port 0 (any free port) never clashes.
                 if addr.port() != 0 && !seen.insert(addr) {
@@ -54,7 +58,39 @@ impl Server {
                 listeners.push((l, ctx.clone(), tls));
             }
         }
-        Ok(Self { listeners, registry, exec })
+        let servers = Arc::new(ctxs);
+        let mut http = Vec::new();
+        let mut seen = HashSet::new();
+        for conf in config.http {
+            if !conf.has_rtmp() {
+                debug!("http server on {:?} has no rtmp_stat / rtmp_control, not started", conf.listen);
+                continue;
+            }
+            let addrs = conf.listen.clone();
+            let ctx = Arc::new(crate::http::HttpCtx {
+                conf,
+                servers: servers.clone(),
+                registry: registry.clone(),
+                prefix: prefix.clone(),
+            });
+            for addr in addrs {
+                if addr.port() != 0 && !seen.insert(addr) {
+                    info!("http: {addr} already bound by an earlier server block, skipping");
+                    continue;
+                }
+                let l = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("bind {addr} (http) failed: {e}")))?;
+                info!("listening on {} (http)", l.local_addr()?);
+                http.push((l, ctx.clone()));
+            }
+        }
+        Ok(Self { listeners, http, registry, exec })
+    }
+
+    /// Bound addresses of the `http {}` servers.
+    pub fn http_addrs(&self) -> Vec<SocketAddr> {
+        self.http.iter().filter_map(|(l, _)| l.local_addr().ok()).collect()
     }
 
     /// Bound addresses with the index of their `server {}` block and
@@ -74,6 +110,9 @@ impl Server {
         // exec_static children live as long as this future.
         let _statics = self.exec.start_statics();
         let mut tasks = Vec::new();
+        for (l, ctx) in self.http {
+            tasks.push(tokio::spawn(crate::http::accept_loop(l, ctx)));
+        }
         let mut started = HashSet::new();
         for (l, ctx, tls) in self.listeners {
             if started.insert(ctx.index) {

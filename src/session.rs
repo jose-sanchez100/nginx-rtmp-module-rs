@@ -15,7 +15,8 @@ use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
 use crate::config::{AccessAction, AccessScope, AppConf, MetaMode, RelayTarget, ServerConf};
 use crate::handshake;
-use crate::live::{LiveError, Peer, Registry, SessionId, StreamRef};
+use crate::control::Control;
+use crate::live::{ConnectInfo, LiveError, Peer, PeerInfo, Registry, SessionId, StreamRef};
 use crate::message::{self as msg, *};
 use crate::monitor::Role;
 use crate::notify::{self, Form, Reply};
@@ -161,6 +162,7 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let id = next_session_id();
+    ctx.registry.stats.naccepted.fetch_add(1, Ordering::Relaxed);
     let span = tracing::info_span!("session", id, client = %addr);
     async move {
         info!("connected");
@@ -195,16 +197,21 @@ where
     let (tx, rx) = mpsc::channel(conf.out_queue.max(8));
     let close = Arc::new(Notify::new());
     let out_bytes = Arc::new(AtomicU64::new(0));
-    let writer = tokio::spawn(writer_task(wr, rx, conf.timeout, close.clone(), out_bytes.clone()).in_current_span());
+    let writer = tokio::spawn(
+        writer_task(wr, rx, conf.timeout, close.clone(), out_bytes.clone(), ctx.registry.clone()).in_current_span(),
+    );
     let bytes_in = Arc::new(AtomicU64::new(0));
     let _monitored =
         ctx.registry.monitor.register(id, addr, ctx.index, bytes_in.clone(), out_bytes.clone(), close.clone());
 
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let info = Arc::new(PeerInfo::new(addr.ip().to_string(), Some(ctl_tx)));
+    let last_ts = info.last_ts.clone();
     let mut s = Session {
         id,
         addr,
         ctx: ctx.clone(),
-        peer: Peer { id, tx, close: close.clone() },
+        peer: Peer { id, tx, close: close.clone(), info },
         decoder: ChunkDecoder::new(conf.max_message, conf.max_streams, conf.publish_time_fix),
         connected: false,
         app: None,
@@ -221,7 +228,7 @@ where
         buflen: conf.buflen.as_millis() as u32,
         joined: None,
         last_av: Instant::now(),
-        last_ts: Arc::new(AtomicU32::new(0)),
+        last_ts,
         notify: None,
         log: LogCtx::default(),
         bytes_in,
@@ -229,7 +236,7 @@ where
         record: None,
     };
 
-    let result = s.read_loop(&mut rd).await;
+    let result = s.read_loop(&mut rd, ctl_rx).await;
     s.leave_stream();
     s.notify_done();
     s.exec_done();
@@ -265,6 +272,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     timeout: Duration,
     close: Arc<Notify>,
     out_bytes: Arc<AtomicU64>,
+    registry: Arc<Registry>,
 ) {
     let mut enc = ChunkEncoder::default();
     let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -287,6 +295,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         match tokio::time::timeout(timeout, w.write_all(&buf)).await {
             Ok(Ok(())) => {
                 out_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                registry.stats.bw_out.lock().unwrap().update(buf.len() as u64);
                 buf.clear();
             }
             Ok(Err(e)) => {
@@ -314,7 +323,11 @@ impl Session {
         self.peer.tx.try_send(m).map_err(|_| SessionError::QueueFull)
     }
 
-    async fn read_loop<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<()> {
+    async fn read_loop<R: AsyncRead + Unpin>(
+        &mut self,
+        rd: &mut R,
+        mut ctl: mpsc::UnboundedReceiver<Control>,
+    ) -> Result<()> {
         let ping = self.conf().ping;
         let ping_timeout = self.conf().ping_timeout;
         let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -331,6 +344,11 @@ impl Session {
                     // Writer failed (peer gone / send timeout) or a stream
                     // dropped us (mandatory frame lost).
                     return Err(SessionError::Protocol("output closed".into()));
+                }
+                Some(c) = ctl.recv() => {
+                    if let Flow::Close = self.handle_control(c).await? {
+                        return Ok(());
+                    }
                 }
                 _ = sleep_until(ping_deadline) => {
                     // ngx_rtmp_ping()
@@ -384,6 +402,7 @@ impl Session {
         self.in_bytes = self.in_bytes.wrapping_add(n as u32);
         self.log.in_bytes += n as u64;
         self.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+        self.ctx.registry.stats.bw_in.lock().unwrap().update(n as u64);
         if self.in_bytes >= 0xf000_0000 {
             debug!("resetting byte counter");
             self.in_bytes = 0;
@@ -627,6 +646,11 @@ impl Session {
         };
         self.app = Some(conf);
         self.ctx.registry.monitor.set_app(self.id, &app, &self.flashver);
+        let _ = self.peer.info.connect.set(ConnectInfo {
+            flashver: self.flashver.clone(),
+            page_url: self.page_url.clone(),
+            swf_url: self.swf_url.clone(),
+        });
         self.app_name = app;
         self.connected = true;
 
@@ -829,6 +853,40 @@ impl Session {
             self.send(msg::status("NetStream.Unpause.Notify", "status", "Unpaused live"))?;
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Control (ngx_rtmp_control_module.c)
+    // -----------------------------------------------------------------
+
+    async fn handle_control(&mut self, c: Control) -> Result<Flow> {
+        match c {
+            Control::Record { start, recorder, reply } => {
+                let r = match &mut self.record {
+                    Some(rec) => rec.control(start, &recorder),
+                    None => Err("Recorder not found".into()),
+                };
+                let _ = reply.send(r);
+                Ok(Flow::Continue)
+            }
+            Control::Redirect { name, reply } => {
+                // ngx_rtmp_control_redirect_handler: close the stream, then
+                // publish or play the new name like a client would.
+                let Some(publishing) = self.joined.as_ref().map(|j| j.publishing) else {
+                    let _ = reply.send(Ok(()));
+                    return Ok(Flow::Continue);
+                };
+                info!("control: redirect to '{name}'");
+                self.cmd_close_stream()?;
+                let flow = if publishing { self.cmd_publish(&name, "").await } else { self.cmd_play(&name).await };
+                let _ = reply.send(match &flow {
+                    Ok(Flow::Continue) => Ok(()),
+                    _ if publishing => Err("publish failed".into()),
+                    _ => Err("play failed".into()),
+                });
+                flow
+            }
+        }
     }
 
     // -----------------------------------------------------------------

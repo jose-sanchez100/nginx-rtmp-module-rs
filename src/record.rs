@@ -232,6 +232,28 @@ impl Recording {
         }
     }
 
+    /// `record start|stop` from the control module (`ngx_rtmp_record_open`
+    /// / `ngx_rtmp_record_close`): the path of the file opened or closed,
+    /// `None` when it already was.
+    pub fn control(&mut self, start: bool, recorder: &str) -> Result<Option<String>, String> {
+        let Some(i) = self.nodes.iter().position(|n| n.rec.id == recorder) else {
+            return Err("Recorder not found".into());
+        };
+        debug!("record: {recorder} manual {}", if start { "open" } else { "close" });
+        if self.nodes[i].file.is_some() != start {
+            if start {
+                self.open(i);
+                if self.nodes[i].file.is_none() {
+                    return Err("Recorder error".into());
+                }
+            } else {
+                self.close(i);
+            }
+            return Ok(Some(self.nodes[i].path.clone()));
+        }
+        Ok(None)
+    }
+
     /// `ngx_rtmp_record_stop`: close every open file.
     pub fn stop(&mut self) {
         debug!("record: stop");

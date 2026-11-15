@@ -31,19 +31,20 @@ The port is a **standalone RTMP server** on `tokio`:
 | `ngx_rtmp_core_module.c` | `src/config.rs` | ✅ core directives (`so_keepalive` not applied yet) |
 | `ngx_rtmp_cmd_module.c` | `src/session.rs` | ✅ connect/createStream/publish/play/play2/pause/close/delete |
 | `ngx_rtmp_live_module.c` | `src/live.rs` | ✅ wait_key, wait_video, interleave, sync, publish_notify, play_restart, idle_streams, drop_idle_publisher |
-| `ngx_rtmp_codec_module.c` | `src/codec.rs` | 🟡 AAC/AVC sequence headers, `meta on/copy/off`; SPS/AudioSpecificConfig parsing still missing (needed by HLS/stat). Extra: Enhanced RTMP (HEVC/AV1) |
+| `ngx_rtmp_codec_module.c` | `src/codec.rs` | ✅ AAC/AVC sequence headers, SPS and AudioSpecificConfig parsing (profile, level, size, sample rate, channels, SBR/PS), `meta on/copy/off`. Extra: Enhanced RTMP (HEVC/AV1) |
 | `ngx_rtmp_access_module.c` | `src/config.rs`, `src/session.rs` | ✅ allow/deny with CIDR |
 | `ngx_rtmp_shared.c`, `ngx_rtmp_bandwidth.c` | — | not needed (`Bytes` is refcounted) / basic counters in `live::StreamStats` |
 | `ngx_rtmp_proxy_protocol.c` | — | ⬜ |
 | `ngx_rtmp_limit_module.c` | — | ⬜ `max_connections` |
-| `ngx_rtmp_record_module.c` | `src/record.rs` | ✅ `record` (`all`, `audio`, `video`, `keyframes`, `manual`, `off`), `record_path`, `record_suffix` (with `strftime` patterns), `record_unique`, `record_append`, `record_lock`, `record_max_size`, `record_max_frames`, `record_interval`, `record_notify`, `recorder` blocks; pulled streams are recorded too. `manual` recorders need the control module (not ported) |
+| `ngx_rtmp_record_module.c` | `src/record.rs` | ✅ `record` (`all`, `audio`, `video`, `keyframes`, `manual`, `off`), `record_path`, `record_suffix` (with `strftime` patterns), `record_unique`, `record_append`, `record_lock`, `record_max_size`, `record_max_frames`, `record_interval`, `record_notify`, `recorder` blocks; pulled streams are recorded too. `manual` recorders are started and stopped through the control module |
 | `ngx_rtmp_play_module.c`, `ngx_rtmp_flv_module.c`, `ngx_rtmp_mp4_module.c` | — | ⬜ VOD (`play /path`) |
 | `ngx_rtmp_relay_module.c` | `src/relay.rs` | ✅ `push`, `pull` (also `rtmps://`, see below), `pull ... static`, `push_reconnect`, `pull_reconnect`, `relay_buffer`; all URL parameters (`app`, `name`, `playPath`, `tcUrl`, `pageUrl`, `swfUrl`, `flashVer`, `live`, `start`, `stop`, `static`) |
 | `ngx_rtmp_notify_module.c`, `ngx_rtmp_netcall_module.c` | `src/notify.rs`, `src/session.rs` | ✅ `on_connect`, `on_disconnect`, `on_publish`, `on_play`, `on_publish_done`, `on_play_done`, `on_done`, `on_update`, `notify_method`, `notify_update_timeout`, `notify_update_strict`, `notify_relay_redirect`, `netcall_timeout`; 3xx redirects to a new app/stream name or to an `rtmp://` URL (push/pull). `on_record_done` |
 | `ngx_rtmp_exec_module.c` | `src/exec.rs` | ✅ `exec`, `exec_push`, `exec_pull`, `exec_static`, `exec_publish`, `exec_publish_done`, `exec_play`, `exec_play_done`, `respawn`, `respawn_timeout`, `exec_kill_signal`, `exec_options` (`name=`); `$var` arguments and `>file` / `2>>file` / `2>&1` redirection. Works on Windows (the C module is compiled out there). `exec_record_done` (with `$recorder`, `$path`, `$filename`, `$basename`, `$dirname`) |
 | `ngx_rtmp_auto_push_module.c` | — | not applicable (nginx multi-worker); tokio runs a single process |
 | `ngx_rtmp_log_module.c` | `access_log.rs` | ✅ `access_log`, `log_format`, all variables |
-| `ngx_rtmp_stat_module.c`, `ngx_rtmp_control_module.c` | — | ⬜ need an HTTP endpoint of their own |
+| `ngx_rtmp_stat_module.c` | `src/stat.rs`, `src/http.rs` | ✅ `rtmp_stat` (`all`, `global`, `live`, `clients`), `rtmp_stat_stylesheet`; same XML as nginx, so `stat.xsl` (shipped in `html/`) works |
+| `ngx_rtmp_control_module.c` | `src/control.rs`, `src/http.rs` | ✅ `rtmp_control` (`all`, `record`, `drop`, `redirect`): `record/start|stop`, `drop/publisher|subscriber|client`, `redirect/publisher|subscriber|client` with `srv`, `app`, `name`, `addr`, `clientid`, `rec`, `newname` |
 | `hls/` | — | ⬜ MPEG-TS + m3u8 |
 | `dash/` | — | ⬜ fMP4 + MPD |
 
@@ -87,6 +88,25 @@ The port is a **standalone RTMP server** on `tokio`:
   sequence header is written once (nginx writes it twice at the start of a file).
   The reported path uses the platform's separator before the file name
   (`C:\rec\cam.flv`). `record_lock` does nothing on Windows, as in nginx.
+
+- HTTP (stat, control): the `http {}` block is read for `server` / `listen`,
+  `location` (prefix, `=` and `^~`; regular expressions and named locations are
+  skipped with a warning), `root`, `allow` / `deny`, `rtmp_stat`,
+  `rtmp_stat_stylesheet` and `rtmp_control`; every other directive is ignored. Only
+  servers that use `rtmp_stat` or `rtmp_control` are started, so an `http {}` block
+  serving something else does not take its ports. Other locations of those servers
+  serve static files from `root` (default `html`, relative to the prefix). No
+  `listen ... ssl`, no keep-alive (each response closes the connection). Query
+  arguments are URL-decoded (nginx compares them raw).
+- Stat: `<nginx_version>` reports `rtmp-server/VERSION` and `<built>` the
+  executable's modification time. Non-ASCII text is kept as UTF-8 (nginx turns
+  every non-ASCII byte into a space). In each stream the publisher is listed first.
+  Relay connections show their upstream URL as `<address>`; the global byte
+  counters only count client connections. The SPS parser skips scaling lists
+  (nginx misreads the size of streams that carry them).
+- Control: a session handles `record` and `redirect` requests in its own task;
+  the HTTP request waits up to 30 s for each. `record` on a pulled stream works;
+  relays are never redirected and not counted by `redirect`.
 
 ## Running
 
@@ -171,6 +191,6 @@ ffplay rtmp://127.0.0.1/live/test
 
 ## Suggested next steps
 
-1. SPS/ASC parsing in `codec` → `hls`.
-2. `stat` / `control` (HTTP endpoint; `control` also drives `record manual`).
+1. `hls` (MPEG-TS + m3u8, served by the same HTTP server).
+2. `max_connections` (limit module) and `proxy_protocol`.
 3. VOD (`play` module: FLV / MP4 files).

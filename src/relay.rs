@@ -20,7 +20,8 @@ use crate::chunk::{ChunkDecoder, ChunkEncoder, Message};
 use crate::codec;
 use crate::config::{AppConf, MetaMode, RelayTarget, ServerConf};
 use crate::handshake;
-use crate::live::{Peer, StreamRef};
+use crate::control::Control;
+use crate::live::{Peer, PeerInfo, StreamRef};
 use crate::message::{self as msg, *};
 use crate::session::{ServerCtx, next_session_id};
 use bytes::BytesMut;
@@ -353,7 +354,7 @@ async fn push_once(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str, t: &Rel
     let id = next_session_id();
     let (tx, mut rx) = mpsc::channel(conf.out_queue.max(8));
     let close = Arc::new(Notify::new());
-    let peer = Peer { id, tx, close: close.clone() };
+    let peer = Peer { id, tx, close: close.clone(), info: Arc::new(PeerInfo::new(t.url.clone(), None)) };
     ctx.registry
         .play(ctx.index, app, name, &peer)
         .map_err(|e| RelayError::Local(e.to_string()))?;
@@ -392,7 +393,7 @@ async fn push_once(ctx: &Arc<ServerCtx>, app: &Arc<AppConf>, name: &str, t: &Rel
                     }
                 }
                 _ = close.notified() => {
-                    return Err(RelayError::Local("dropped by live module (queue overflow)".into()));
+                    return Err(RelayError::Local("dropped (queue overflow or control request)".into()));
                 }
             }
         }
@@ -504,7 +505,9 @@ async fn pull_once(
     // Publish locally (`ngx_rtmp_relay_publish_local`).
     let id = next_session_id();
     let (tx, _rx) = mpsc::channel(1);
-    let peer = Peer { id, tx, close: Arc::new(Notify::new()) };
+    let (ctl_tx, mut ctl) = mpsc::unbounded_channel();
+    let close = Arc::new(Notify::new());
+    let peer = Peer { id, tx, close: close.clone(), info: Arc::new(PeerInfo::new(t.url.clone(), Some(ctl_tx))) };
     let stream = ctx
         .registry
         .publish(ctx.index, app, name, &peer)
@@ -524,7 +527,7 @@ async fn pull_once(
     };
     let mut rec = crate::record::Recording::start(&app.recorders, ctx.exec.prefix.as_deref(), name, owner);
 
-    let r = pull_pump(&mut c, app, &stream, is_static, &mut rec).await;
+    let r = pull_pump(&mut c, app, &stream, is_static, &mut rec, &close, &mut ctl).await;
     drop(rec);
     drop(stream);
     ctx.registry.leave(ctx.index, &app.name, name, id);
@@ -537,6 +540,8 @@ async fn pull_pump(
     stream: &StreamRef,
     is_static: bool,
     rec: &mut Option<crate::record::Recording>,
+    close: &Notify,
+    ctl: &mut mpsc::UnboundedReceiver<Control>,
 ) -> Result<()> {
     let mut check =
         tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
@@ -559,6 +564,22 @@ async fn pull_pump(
                     return Ok(());
                 }
             }
+            _ = close.notified() => {
+                return Err(RelayError::Local("dropped by a control request".into()));
+            }
+            Some(c) = ctl.recv() => match c {
+                Control::Record { start, recorder, reply } => {
+                    let r = match rec {
+                        Some(rec) => rec.control(start, &recorder),
+                        None => Err("Recorder not found".into()),
+                    };
+                    let _ = reply.send(r);
+                }
+                // Not offered to relays (see control::redirect).
+                Control::Redirect { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+            },
         }
     }
 }

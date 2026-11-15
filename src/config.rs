@@ -1,8 +1,9 @@
 //! nginx-style configuration.
 //!
-//! Accepts a full `nginx.conf` (other top-level blocks such as `events` or
-//! `http` are ignored) or a file containing only the `rtmp { ... }` block, so
-//! existing nginx-rtmp configurations can be reused unchanged.
+//! Accepts a full `nginx.conf` or a file containing only the `rtmp { ... }`
+//! block, so existing nginx-rtmp configurations can be reused unchanged.
+//! Other top-level blocks such as `events` are ignored; from `http` only
+//! what the stat and control modules use is read.
 //!
 //! Directive inheritance follows nginx: server-level directives written in
 //! `rtmp {}` are defaults for every `server {}`, and application-level
@@ -409,6 +410,76 @@ pub struct Config {
     pub pid: Option<String>,
     /// `exec_static`, `respawn_timeout`, `exec_kill_signal` (global).
     pub exec: crate::exec::MainExec,
+    /// `server {}` blocks of the `http {}` block.
+    pub http: Vec<HttpServerConf>,
+}
+
+/// One level of an `http {}` server: the server itself or a `location`.
+/// Only what the stat and control modules (and serving their stylesheet)
+/// need is kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpLocation {
+    /// URI prefix (`None` at server level).
+    pub path: Option<String>,
+    /// `location = /path`.
+    pub exact: bool,
+    /// `rtmp_stat` mask (`crate::stat`).
+    pub stat: u8,
+    pub stylesheet: String,
+    /// `rtmp_control` mask (`crate::control`).
+    pub control: u8,
+    /// `root` for static files, relative to the prefix.
+    pub root: String,
+    pub access: Vec<AccessRule>,
+}
+
+impl Default for HttpLocation {
+    fn default() -> Self {
+        Self {
+            path: None,
+            exact: false,
+            stat: 0,
+            stylesheet: String::new(),
+            control: 0,
+            root: "html".into(),
+            access: Vec::new(),
+        }
+    }
+}
+
+impl HttpLocation {
+    /// `ngx_http_access_module`: first matching rule wins, default allow.
+    pub fn allowed(&self, ip: IpAddr) -> bool {
+        self.access.iter().find(|r| r.matches(ip)).is_none_or(|r| r.action == AccessAction::Allow)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpServerConf {
+    pub listen: Vec<SocketAddr>,
+    /// Settings written at server level, used when no location matches.
+    pub server: HttpLocation,
+    pub locations: Vec<HttpLocation>,
+}
+
+impl HttpServerConf {
+    /// nginx location lookup: an exact match, else the longest prefix.
+    pub fn find(&self, uri: &str) -> &HttpLocation {
+        if let Some(l) = self.locations.iter().find(|l| l.exact && l.path.as_deref() == Some(uri)) {
+            return l;
+        }
+        self.locations
+            .iter()
+            .filter(|l| !l.exact && l.path.as_deref().is_some_and(|p| uri.starts_with(p)))
+            .max_by_key(|l| l.path.as_ref().map_or(0, String::len))
+            .unwrap_or(&self.server)
+    }
+
+    /// Whether any level enables `rtmp_stat` or `rtmp_control`; other
+    /// servers of the `http {}` block are not this program's business.
+    pub fn has_rtmp(&self) -> bool {
+        std::iter::once(&self.server).chain(&self.locations).any(|l| l.stat != 0 || l.control != 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -541,10 +612,16 @@ impl Config {
             }
             servers.push(srv);
         }
+        let mut http = Vec::new();
+        for h in tree.iter().filter(|d| d.name == "http") {
+            if let Some(block) = &h.block {
+                cx.http_block(block, &mut http)?;
+            }
+        }
         for w in cx.warnings {
             tracing::warn!("{w}");
         }
-        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid, exec: cx.exec })
+        Ok(Config { servers, log_formats: cx.formats, prefix: None, error_log, pid, exec: cx.exec, http })
     }
 }
 
@@ -967,6 +1044,106 @@ impl RelayTarget {
 
 /// nginx time syntax: `500ms`, `30s`, `1m`, `1h`, `1d`, combinations like
 /// `1m30s`; a bare number means seconds.
+impl Cx<'_> {
+    /// `http {}`: servers with their locations. Directives other than the
+    /// ones the stat and control modules use are ignored silently.
+    fn http_block(&mut self, block: &[Directive], out: &mut Vec<HttpServerConf>) -> Result<(), ConfigError> {
+        let mut main = HttpLocation::default();
+        for d in block.iter().filter(|d| d.name != "server") {
+            self.http_apply(d, &mut main)?;
+        }
+        for s in block.iter().filter(|d| d.name == "server") {
+            let Some(sblock) = &s.block else { continue };
+            let mut srv = HttpServerConf { listen: Vec::new(), server: main.clone(), locations: Vec::new() };
+            let inherited = std::mem::take(&mut srv.server.access);
+            for d in sblock.iter().filter(|d| d.name != "location") {
+                if d.name == "listen" {
+                    let Some(v) = d.args.first() else {
+                        return Err(self.err(d.line, "invalid number of arguments in \"listen\""));
+                    };
+                    if d.args.iter().skip(1).any(|a| a == "ssl" || a == "quic") {
+                        self.warnings.push(format!(
+                            "{}:{}: \"listen {v}\" with ssl is not supported for http, ignored",
+                            self.file, d.line
+                        ));
+                        continue;
+                    }
+                    let v = if v.contains(':') || v.parse::<u16>().is_ok() { v.clone() } else { format!("{v}:80") };
+                    let addr =
+                        parse_listen(&v).ok_or_else(|| self.err(d.line, format!("invalid listen \"{v}\"")))?;
+                    srv.listen.push(addr);
+                } else {
+                    self.http_apply(d, &mut srv.server)?;
+                }
+            }
+            if srv.server.access.is_empty() {
+                srv.server.access = inherited;
+            }
+            for l in sblock.iter().filter(|d| d.name == "location") {
+                let Some(lblock) = &l.block else { continue };
+                let (exact, path) = match l.args.as_slice() {
+                    [p] if p.starts_with('@') => continue,
+                    [p] => (false, p.clone()),
+                    [m, p] if m == "=" => (true, p.clone()),
+                    [m, p] if m == "^~" => (false, p.clone()),
+                    [m, _] if m.starts_with('~') => {
+                        self.warnings.push(format!(
+                            "{}:{}: regular expression locations are not supported, ignored",
+                            self.file, l.line
+                        ));
+                        continue;
+                    }
+                    _ => return Err(self.err(l.line, "invalid number of arguments in \"location\"")),
+                };
+                let mut loc = srv.server.clone();
+                loc.path = Some(path);
+                loc.exact = exact;
+                let inherited = std::mem::take(&mut loc.access);
+                for d in lblock {
+                    self.http_apply(d, &mut loc)?;
+                }
+                if loc.access.is_empty() {
+                    loc.access = inherited;
+                }
+                srv.locations.push(loc);
+            }
+            if srv.listen.is_empty() {
+                srv.listen.push("0.0.0.0:80".parse().unwrap());
+            }
+            out.push(srv);
+        }
+        Ok(())
+    }
+
+    fn http_apply(&mut self, d: &Directive, l: &mut HttpLocation) -> Result<(), ConfigError> {
+        let mask = |cx: &Self, parse: fn(&str) -> Option<u8>| -> Result<u8, ConfigError> {
+            if d.args.is_empty() {
+                return Err(cx.err(d.line, format!("invalid number of arguments in \"{}\"", d.name)));
+            }
+            d.args.iter().try_fold(0, |m, a| {
+                parse(a)
+                    .map(|f| m | f)
+                    .ok_or_else(|| cx.err(d.line, format!("invalid value \"{a}\" in \"{}\"", d.name)))
+            })
+        };
+        match d.name.as_str() {
+            "rtmp_stat" => l.stat = mask(self, crate::stat::parse_flag)?,
+            "rtmp_stat_stylesheet" => l.stylesheet = self.one(d)?.to_string(),
+            "rtmp_control" => l.control = mask(self, crate::control::parse_flag)?,
+            "root" => l.root = self.one(d)?.to_string(),
+            "allow" | "deny" => {
+                let r = self.access_rule(d)?;
+                if r.scope != AccessScope::Both {
+                    return Err(self.err(d.line, format!("invalid number of arguments in \"{}\"", d.name)));
+                }
+                l.access.push(r);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 pub fn parse_time(v: &str) -> Option<Duration> {
     let mut total_ms: u64 = 0;
     let mut num = String::new();
@@ -1196,6 +1373,47 @@ rtmp { server { } }", "t").is_err());
         assert!(b.respawn && b.push.is_empty() && b.publish.len() == 1);
         assert!(Config::parse("rtmp { exec_kill_signal BOGUS; server {} }", "t").is_err());
         assert!(Config::parse("rtmp { server { application a { exec; } } }", "t").is_err());
+    }
+
+    #[test]
+    fn http_block() {
+        let c = Config::parse(
+            r#"
+rtmp { server { application live { live on; } } }
+http {
+    rtmp_stat live;
+    deny 10.0.0.0/8;
+    server {
+        listen 8080;
+        listen localhost;
+        listen [::1]:8443 ssl;
+        root www;
+        location /stat { rtmp_stat all; rtmp_stat_stylesheet stat.xsl; }
+        location = /control { rtmp_control drop record; allow 127.0.0.1; deny all; }
+        location ~ \.xsl$ { root x; }
+        location @named { }
+    }
+    server { listen 81; location / { } }
+}"#,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(c.http.len(), 2);
+        let s = &c.http[0];
+        assert_eq!(s.listen, ["0.0.0.0:8080".parse().unwrap(), "127.0.0.1:80".parse().unwrap()]);
+        assert_eq!(s.locations.len(), 2, "regex and named locations are skipped");
+        let stat = s.find("/stat");
+        assert_eq!((stat.stat, stat.stylesheet.as_str(), stat.root.as_str()), (0xff, "stat.xsl", "www"));
+        assert!(!stat.allowed("10.1.2.3".parse().unwrap()), "rules inherited from http");
+        let ctl = s.find("/control");
+        assert_eq!((ctl.control, ctl.stat), (crate::control::DROP | crate::control::RECORD, crate::stat::LIVE));
+        assert!(ctl.allowed("127.0.0.1".parse().unwrap()));
+        assert!(!ctl.allowed("10.1.2.3".parse().unwrap()) && !ctl.allowed("192.168.0.1".parse().unwrap()));
+        assert_eq!(s.find("/control/drop/client").path, None, "exact location only");
+        assert!(s.has_rtmp());
+        // inherited `rtmp_stat live` counts too
+        assert!(c.http[1].has_rtmp());
+        assert!(Config::parse("rtmp { server { } } http { server { rtmp_stat bogus; } }", "t").is_err());
     }
 
     #[test]

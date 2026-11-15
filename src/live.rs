@@ -10,7 +10,9 @@ use crate::config::AppConf;
 use crate::message::{self as msg, CSID_AUDIO, CSID_VIDEO, MSG_AUDIO, MSG_VIDEO, MSID};
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 
 pub type SessionId = u64;
@@ -21,6 +23,93 @@ pub struct Peer {
     pub id: SessionId,
     pub tx: mpsc::Sender<Message>,
     pub close: Arc<Notify>,
+    pub info: Arc<PeerInfo>,
+}
+
+/// What the statistics and control modules need to know about the session
+/// behind a [`Peer`].
+pub struct PeerInfo {
+    /// Client IP address; the upstream URL for relays.
+    pub addr: String,
+    pub started: Instant,
+    /// Set once the client sends `connect`.
+    pub connect: OnceLock<ConnectInfo>,
+    /// Timestamp of the last message received (`s->current_time`).
+    pub last_ts: Arc<AtomicU32>,
+    /// Requests from the control module, carried out by the session task.
+    pub ctl: Option<mpsc::UnboundedSender<crate::control::Control>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ConnectInfo {
+    pub flashver: String,
+    pub page_url: String,
+    pub swf_url: String,
+}
+
+impl PeerInfo {
+    pub fn new(addr: String, ctl: Option<mpsc::UnboundedSender<crate::control::Control>>) -> Self {
+        Self { addr, started: Instant::now(), connect: OnceLock::new(), last_ts: Arc::default(), ctl }
+    }
+}
+
+/// Seconds on a monotonic clock, for [`Bandwidth`].
+fn now_secs() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs() + 1
+}
+
+const BANDWIDTH_INTERVAL: u64 = 10;
+
+/// Byte counter with the rate of the last 10-second interval
+/// (`ngx_rtmp_bandwidth_t`).
+#[derive(Debug, Default, Clone)]
+pub struct Bandwidth {
+    pub bytes: u64,
+    bandwidth: u64,
+    intl_bytes: u64,
+    intl_end: u64,
+}
+
+impl Bandwidth {
+    /// `ngx_rtmp_update_bandwidth`.
+    pub fn update(&mut self, bytes: u64) {
+        let now = now_secs();
+        if now > self.intl_end {
+            self.bandwidth =
+                if now > self.intl_end + BANDWIDTH_INTERVAL { 0 } else { self.intl_bytes / BANDWIDTH_INTERVAL };
+            self.intl_bytes = 0;
+            self.intl_end = now + BANDWIDTH_INTERVAL;
+        }
+        self.bytes += bytes;
+        self.intl_bytes += bytes;
+    }
+
+    /// Bytes per second over the last complete interval.
+    pub fn rate(&mut self) -> u64 {
+        self.update(0);
+        self.bandwidth
+    }
+}
+
+/// Server-wide counters for the statistics page.
+pub struct GlobalStats {
+    pub started: Instant,
+    /// Accepted connections (`ngx_rtmp_naccepted`).
+    pub naccepted: AtomicU64,
+    pub bw_in: Mutex<Bandwidth>,
+    pub bw_out: Mutex<Bandwidth>,
+}
+
+impl Default for GlobalStats {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            naccepted: AtomicU64::new(0),
+            bw_in: Default::default(),
+            bw_out: Default::default(),
+        }
+    }
 }
 
 impl Peer {
@@ -66,17 +155,13 @@ impl Player {
     }
 }
 
-#[derive(Default)]
-pub struct StreamStats {
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub publish_started: Option<std::time::Instant>,
-}
-
 pub struct Stream {
     pub name: String,
+    server: usize,
     app: Arc<AppConf>,
-    publisher: Option<SessionId>,
+    /// When the stream was created (`stream->epoch`).
+    epoch: Instant,
+    publisher: Option<Peer>,
     active: bool,
     players: Vec<Player>,
     /// Publisher-side last timestamps per chunk-stream index.
@@ -88,7 +173,12 @@ pub struct Stream {
     meta_ts: u32,
     meta_version: u32,
     pub meta_info: codec::MetaInfo,
-    pub stats: StreamStats,
+    /// Codec state of the current publisher.
+    pub codec: codec::CodecInfo,
+    pub bw_in: Bandwidth,
+    pub bw_out: Bandwidth,
+    pub bw_audio: Bandwidth,
+    pub bw_video: Bandwidth,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -108,6 +198,8 @@ pub struct Registry {
     pulling: Mutex<std::collections::HashSet<String>>,
     /// Connections, for user interfaces.
     pub monitor: Arc<crate::monitor::Monitor>,
+    /// Totals for the statistics page.
+    pub stats: GlobalStats,
 }
 
 /// Point-in-time copy of one stream.
@@ -122,18 +214,45 @@ pub struct StreamInfo {
     pub meta: codec::MetaInfo,
 }
 
+/// One session of a stream, for the statistics page.
+pub struct ClientStat {
+    pub peer: Peer,
+    pub publishing: bool,
+    pub dropped: u64,
+    /// Audio minus video timestamp sent to a player.
+    pub avsync: i32,
+}
+
+/// One stream, for the statistics page.
+pub struct StreamStat {
+    pub name: String,
+    /// Milliseconds since the stream was created.
+    pub time_ms: u64,
+    pub bw_in: Bandwidth,
+    pub bw_out: Bandwidth,
+    pub bw_audio: Bandwidth,
+    pub bw_video: Bandwidth,
+    pub clients: Vec<ClientStat>,
+    /// Present while the stream has a publisher.
+    pub codec: Option<codec::CodecInfo>,
+    pub publishing: bool,
+    pub active: bool,
+}
+
 impl Registry {
     fn key(server: usize, app: &str, name: &str) -> String {
         format!("{server}/{app}/{name}")
     }
 
-    fn get_or_create(&self, key: &str, name: &str, app: &Arc<AppConf>) -> StreamRef {
+    fn get_or_create(&self, server: usize, key: &str, name: &str, app: &Arc<AppConf>) -> StreamRef {
         let mut map = self.streams.lock().unwrap();
         map.entry(key.to_string())
             .or_insert_with(|| {
                 Arc::new(Mutex::new(Stream {
                     name: name.to_string(),
+                    server,
                     app: app.clone(),
+                    epoch: Instant::now(),
                     publisher: None,
                     active: false,
                     players: Vec::new(),
@@ -144,7 +263,11 @@ impl Registry {
                     meta_ts: 0,
                     meta_version: 0,
                     meta_info: Default::default(),
-                    stats: Default::default(),
+                    codec: Default::default(),
+                    bw_in: Default::default(),
+                    bw_out: Default::default(),
+                    bw_audio: Default::default(),
+                    bw_video: Default::default(),
                 }))
             })
             .clone()
@@ -171,14 +294,13 @@ impl Registry {
         peer: &Peer,
     ) -> Result<StreamRef, LiveError> {
         let key = Self::key(server, &app.name, name);
-        let st = self.get_or_create(&key, name, app);
+        let st = self.get_or_create(server, &key, name, app);
         {
             let mut s = st.lock().unwrap();
             if s.publisher.is_some() {
                 return Err(LiveError::AlreadyPublishing);
             }
-            s.publisher = Some(peer.id);
-            s.stats.publish_started = Some(std::time::Instant::now());
+            s.publisher = Some(peer.clone());
         }
         Ok(st)
     }
@@ -198,7 +320,7 @@ impl Registry {
                 return Err(LiveError::NotFound);
             }
         }
-        let st = self.get_or_create(&key, name, app);
+        let st = self.get_or_create(server, &key, name, app);
         st.lock().unwrap().players.push(Player {
             peer: peer.clone(),
             cs: Default::default(),
@@ -216,14 +338,14 @@ impl Registry {
         let Some(st) = map.get(&key).cloned() else { return };
         let empty = {
             let mut s = st.lock().unwrap();
-            if s.publisher == Some(id) {
+            if s.publisher.as_ref().is_some_and(|p| p.id == id) {
                 s.stop();
                 s.publisher = None;
                 s.aac_header = None;
                 s.avc_header = None;
                 s.meta = None;
                 s.pub_ts = [None; 2];
-                s.stats.publish_started = None;
+                s.codec = Default::default();
             } else {
                 s.players.retain(|p| p.peer.id != id);
             }
@@ -245,7 +367,7 @@ impl Registry {
                     server: k.split('/').next().and_then(|n| n.parse().ok()).unwrap_or(0),
                     app: s.app.name.clone(),
                     name: s.name.clone(),
-                    publisher: s.publisher,
+                    publisher: s.publisher.as_ref().map(|p| p.id),
                     active: s.active,
                     players: s.players.iter().map(|p| p.peer.id).collect(),
                     meta: s.meta_info.clone(),
@@ -254,6 +376,71 @@ impl Registry {
             .collect();
         v.sort_by(|a, b| (a.server, &a.app, &a.name).cmp(&(b.server, &b.app, &b.name)));
         v
+    }
+
+    /// Streams of one application, sorted by name (`ngx_rtmp_stat_live`).
+    pub fn stat(&self, server: usize, app: &str) -> Vec<StreamStat> {
+        let streams: Vec<StreamRef> = self.streams.lock().unwrap().values().cloned().collect();
+        let mut v: Vec<StreamStat> = streams
+            .iter()
+            .filter_map(|s| {
+                let mut guard = s.lock().unwrap();
+                let s = &mut *guard;
+                if s.server != server || s.app.name != app {
+                    return None;
+                }
+                let mut clients = Vec::new();
+                if let Some(p) = &s.publisher {
+                    clients.push(ClientStat { peer: p.clone(), publishing: true, dropped: 0, avsync: 0 });
+                }
+                let interleave = s.app.interleave;
+                for p in &s.players {
+                    clients.push(ClientStat {
+                        peer: p.peer.clone(),
+                        publishing: false,
+                        dropped: p.ndropped,
+                        avsync: if interleave { 0 } else { p.cs[1].timestamp.wrapping_sub(p.cs[0].timestamp) as i32 },
+                    });
+                }
+                for bw in [&mut s.bw_in, &mut s.bw_out, &mut s.bw_audio, &mut s.bw_video] {
+                    bw.update(0);
+                }
+                Some(StreamStat {
+                    name: s.name.clone(),
+                    time_ms: s.epoch.elapsed().as_millis() as u64,
+                    bw_in: s.bw_in.clone(),
+                    bw_out: s.bw_out.clone(),
+                    bw_audio: s.bw_audio.clone(),
+                    bw_video: s.bw_video.clone(),
+                    clients,
+                    codec: s.publisher.is_some().then(|| s.codec.clone()),
+                    publishing: s.publisher.is_some(),
+                    active: s.active,
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Publisher and players of the streams of one application, or of
+    /// the stream `name` only (`ngx_rtmp_control_walk_app`). The flag tells
+    /// the publisher.
+    pub fn sessions(&self, server: usize, app: &str, name: Option<&str>) -> Vec<(Peer, bool)> {
+        let streams: Vec<StreamRef> = match name {
+            Some(n) => self.get(server, app, n).into_iter().collect(),
+            None => self.streams.lock().unwrap().values().cloned().collect(),
+        };
+        let mut out = Vec::new();
+        for s in streams {
+            let s = s.lock().unwrap();
+            if s.server != server || s.app.name != app {
+                continue;
+            }
+            out.extend(s.publisher.iter().map(|p| (p.clone(), true)));
+            out.extend(s.players.iter().map(|p| (p.peer.clone(), false)));
+        }
+        out
     }
 
     /// Snapshot for statistics: (key, publisher present, player count).
@@ -349,6 +536,7 @@ impl Stream {
 
     /// Store metadata to be (re)sent to every player before its next frame.
     pub fn set_meta(&mut self, payload: Option<Bytes>, info: codec::MetaInfo, timestamp: u32) {
+        self.codec.on_meta(&info);
         self.meta_info = info;
         if let Some(p) = payload {
             self.meta = Some(p);
@@ -367,6 +555,7 @@ impl Stream {
         }
         let app = self.app.clone();
         let video = type_id == MSG_VIDEO;
+        self.codec.on_av(video, &payload);
 
         // Codec module: remember sequence headers for late joiners.
         let mut mandatory = false;
@@ -477,7 +666,8 @@ impl Stream {
         }
 
         let len = payload.len() as u64;
-        self.stats.bytes_in += len;
-        self.stats.bytes_out += len * peers;
+        self.bw_in.update(len);
+        self.bw_out.update(len * peers);
+        if video { &mut self.bw_video } else { &mut self.bw_audio }.update(len);
     }
 }
