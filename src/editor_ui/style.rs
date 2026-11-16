@@ -205,6 +205,16 @@ pub fn dialog(_: &Theme) -> container::Style {
     }
 }
 
+/// The sunken area that holds the "add" list.
+pub fn well(_: &Theme) -> container::Style {
+    let c = colors();
+    container::Style {
+        background: Some(c.input.into()),
+        border: Border { radius: 8.0.into(), width: 1.0, color: c.border },
+        ..Default::default()
+    }
+}
+
 pub fn backdrop(_: &Theme) -> container::Style {
     container::Style { background: Some(alpha(Color::BLACK, 0.4).into()), ..Default::default() }
 }
@@ -256,6 +266,16 @@ pub fn ghost(_: &Theme, s: button::Status) -> button::Style {
         button::Status::Hovered | button::Status::Pressed => base_button(Some(c.hover), c.text, Color::TRANSPARENT, 6.0),
         button::Status::Disabled => base_button(None, alpha(c.muted, 0.35), Color::TRANSPARENT, 6.0),
         button::Status::Active => base_button(None, c.muted, Color::TRANSPARENT, 6.0),
+    }
+}
+
+/// An entry of the "add" list: a row that lights up when hovered.
+pub fn entry(_: &Theme, s: button::Status) -> button::Style {
+    let c = colors();
+    match s {
+        button::Status::Hovered => base_button(Some(c.accent_soft), c.text, Color::TRANSPARENT, 6.0),
+        button::Status::Pressed => base_button(Some(alpha(c.accent, 0.25)), c.text, Color::TRANSPARENT, 6.0),
+        _ => base_button(None, c.text, Color::TRANSPARENT, 6.0),
     }
 }
 

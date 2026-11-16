@@ -64,11 +64,13 @@ enum Msg {
     Disable(ItemPath),
     Enable(ItemPath),
     // adding
-    AddPick(AddOption),
-    Add,
+    /// The text of the "add" search box.
+    AddQuery(String),
+    /// Add a known directive by name.
+    Add(&'static str),
+    /// Enter in the search box: the only match, or the text as written.
+    AddSubmit,
     AddComment,
-    Custom(String),
-    CustomSubmit,
     // text view
     Edit(text_editor::Action),
     // header
@@ -76,19 +78,6 @@ enum Msg {
     Revert,
     ReloadServer,
     Answer(bool),
-}
-
-/// An entry of the "add a directive" list.
-#[derive(Debug, Clone, PartialEq)]
-struct AddOption {
-    name: &'static str,
-    label: String,
-}
-
-impl std::fmt::Display for AddOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.label)
-    }
 }
 
 struct Editor {
@@ -109,8 +98,8 @@ struct Editor {
     pending: Option<(Level, String)>,
     busy: bool,
     dialog: Option<Dialog>,
-    add_pick: Option<AddOption>,
-    custom: String,
+    /// What is typed in the "add" search box.
+    query: String,
     /// Text typed in fields that hold several arguments, kept as typed
     /// (re-joining the arguments would eat a trailing space).
     drafts: HashMap<(ItemPath, usize), String>,
@@ -165,8 +154,7 @@ impl Editor {
             pending: None,
             busy: false,
             dialog: None,
-            add_pick: None,
-            custom: String::new(),
+            query: String::new(),
             drafts: HashMap::new(),
             editing: None,
         }
@@ -265,7 +253,7 @@ impl Editor {
                 self.sel = p;
                 self.editing = None;
                 self.drafts.clear();
-                self.add_pick = None;
+                self.query.clear();
                 return iced::widget::operation::snap_to(PANE, iced::widget::operation::RelativeOffset::START);
             }
             Msg::SetMode(m) => self.set_mode(m),
@@ -364,27 +352,35 @@ impl Editor {
                     self.drafts.clear();
                 }
             }
-            Msg::AddPick(o) => self.add_pick = Some(o),
-            Msg::Add => {
-                let ctx = form::ctx_of(&self.tree, &self.sel);
-                let Some(name) = self.add_pick.as_ref().map(|o| o.name) else { return Task::none() };
-                let Some(spec) = form::spec_for(&self.specs, name, ctx) else { return Task::none() };
-                let Some(items) = form::items_at_mut(&mut self.tree, &self.sel) else { return Task::none() };
-                let (at, open) = form::add(items, spec);
-                self.add_pick = None;
-                self.structure_changed(self.sel.clone());
-                if open {
-                    self.sel.push(at);
+            Msg::AddQuery(v) => self.query = v,
+            Msg::Add(name) => return self.add(name),
+            Msg::AddSubmit => {
+                let q = self.query.trim().trim_end_matches(';').trim();
+                let found: Vec<&'static str> = self.matches().iter().flat_map(|(_, l)| l.iter().map(|s| s.name)).collect();
+                // a bare known name, or the only match of a search word;
+                // with arguments typed, the text as written
+                let known = if q.contains(char::is_whitespace) {
+                    None
+                } else if found.contains(&q) {
+                    found.iter().copied().find(|n| *n == q)
+                } else if found.len() == 1 {
+                    Some(found[0])
+                } else {
+                    None
+                };
+                match known {
+                    Some(name) => return self.add(name),
+                    // a search word that matches several: wait for a click
+                    None if !q.contains(char::is_whitespace) && !found.is_empty() => {}
+                    None => {
+                        if let Some(it) = form::parse_custom(&self.query) {
+                            self.query.clear();
+                            self.push_item(it);
+                        }
+                    }
                 }
             }
             Msg::AddComment => self.push_item(Item::Comment { text: " ".into() }),
-            Msg::Custom(v) => self.custom = v,
-            Msg::CustomSubmit => {
-                if let Some(it) = form::parse_custom(&self.custom) {
-                    self.custom.clear();
-                    self.push_item(it);
-                }
-            }
             Msg::Edit(action) => {
                 let edit = action.is_edit();
                 self.content.perform(action);
@@ -552,6 +548,67 @@ impl Editor {
             items.push(it);
         }
         self.structure_changed(self.sel.clone());
+    }
+
+    /// Add the directive `name` to the open block; a new block without
+    /// arguments to fill is opened.
+    fn add(&mut self, name: &str) -> Task<Msg> {
+        let ctx = form::ctx_of(&self.tree, &self.sel);
+        let Some(spec) = form::spec_for(&self.specs, name, ctx) else { return Task::none() };
+        let Some(items) = form::items_at_mut(&mut self.tree, &self.sel) else { return Task::none() };
+        let (at, open) = form::add(items, spec);
+        self.query.clear();
+        self.structure_changed(self.sel.clone());
+        if open {
+            let mut p = self.sel.clone();
+            p.push(at);
+            return self.update(Msg::Select(p));
+        }
+        Task::none()
+    }
+
+    /// The directives the open block accepts that match the search box,
+    /// by module; names that match come before descriptions that do.
+    fn matches(&self) -> Vec<(&'static str, Vec<&Spec>)> {
+        let items = form::items_at(&self.tree, &self.sel).unwrap_or(&[]);
+        let ctx = form::ctx_of(&self.tree, &self.sel);
+        let all = form::available(&self.specs, items, ctx);
+        let q = self.query.trim().to_lowercase();
+        let word = q.split_whitespace().next().unwrap_or("");
+        if word.is_empty() {
+            return all;
+        }
+        // tiers: name starts with the word, name contains it, description
+        // contains the search; with arguments typed, only the exact name
+        let args = q.contains(char::is_whitespace);
+        let tier = |s: &Spec| -> Option<u8> {
+            if args {
+                return (s.name == word).then_some(0);
+            }
+            if s.name.starts_with(word) {
+                Some(0)
+            } else if s.name.contains(word) {
+                Some(1)
+            } else if s.help.to_lowercase().contains(&q) {
+                Some(2)
+            } else {
+                None
+            }
+        };
+        let mut out: Vec<(&'static str, Vec<&Spec>)> = Vec::new();
+        for t in 0..3 {
+            for (m, list) in &all {
+                let hit: Vec<&Spec> = list.iter().copied().filter(|s| tier(s) == Some(t)).collect();
+                if hit.is_empty() {
+                    continue;
+                }
+                match out.iter_mut().find(|(o, _)| o == m) {
+                    Some((_, l)) => l.extend(hit),
+                    None => out.push((*m, hit)),
+                }
+            }
+        }
+        out
     }
 
     // ------------------------------------------------------------- view
@@ -750,7 +807,7 @@ impl Editor {
         if items.iter().all(|i| matches!(i, Item::Blank)) {
             rows = rows.push(text("Nothing here yet.").color(c.muted));
         }
-        col = col.push(rows).push(Space::new().height(6)).push(self.add_bar(items, ctx));
+        col = col.push(rows).push(Space::new().height(6)).push(self.add_bar());
         if let Some(Item::Dir { name, .. }) = me {
             col = col.push(Space::new().height(6)).push(
                 button(text(format!("Delete this {name} block")).size(13))
@@ -969,47 +1026,82 @@ impl Editor {
         }
     }
 
-    fn add_bar<'a>(&'a self, items: &[Item], ctx: &str) -> Element<'a, Msg> {
+    fn add_bar(&self) -> Element<'_, Msg> {
         let c = style::colors();
-        let options: Vec<AddOption> = form::available(&self.specs, items, ctx)
-            .into_iter()
-            .flat_map(|(module, list)| {
-                list.into_iter().map(move |s| AddOption {
-                    name: s.name,
-                    label: format!("{}{}   ({module})", s.name, if s.block.is_some() { " { }" } else { "" }),
-                })
-            })
-            .collect();
-        let help = self
-            .add_pick
-            .as_ref()
-            .and_then(|o| form::spec_for(&self.specs, o.name, ctx))
-            .map(|s| if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) })
-            .unwrap_or_else(|| "Pick a directive this block accepts, or type one by hand.".into());
+        let groups = self.matches();
+        let q = self.query.trim();
+        let written = (form::parse_custom(&self.query).is_some() && (groups.is_empty() || q.contains(char::is_whitespace)))
+            .then(|| {
+                button(
+                    row![
+                        text("Add as written:").size(13).color(c.muted),
+                        text(format!("{};", q.trim_end_matches(';'))).font(Font::MONOSPACE).size(13),
+                        Space::new().width(Length::Fill),
+                        text("Enter").size(11).color(c.muted),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([8, 10])
+                .style(style::entry)
+                .on_press(Msg::AddSubmit)
+            });
+        let mut list = column![].spacing(2).push(written);
+        for (module, specs) in &groups {
+            list = list.push(
+                container(text(module.to_uppercase()).size(11).font(style::SEMIBOLD).color(c.muted)).padding(
+                    iced::Padding { top: 8.0, bottom: 2.0, left: 10.0, right: 10.0 },
+                ),
+            );
+            for s in specs {
+                let name = row![text(s.name).font(Font { weight: iced::font::Weight::Semibold, ..Font::MONOSPACE }).size(13)]
+                    .push(s.block.is_some().then(|| text(" { }").font(Font::MONOSPACE).size(13).color(c.muted)));
+                let help = container(text(s.help).size(12).color(c.muted).wrapping(text::Wrapping::None))
+                    .width(Length::Fill)
+                    .clip(true);
+                list = list.push(
+                    button(row![container(name).width(220), help].spacing(12).align_y(Alignment::Center))
+                        .width(Length::Fill)
+                        .padding([6, 10])
+                        .style(style::entry)
+                        .on_press(Msg::Add(s.name)),
+                );
+            }
+        }
+        if groups.is_empty() && !q.contains(char::is_whitespace) {
+            let msg = if q.is_empty() {
+                "Every directive this block accepts is already here.".to_string()
+            } else {
+                format!("No known directive matches \"{q}\".")
+            };
+            list = list.push(container(text(msg).size(13).color(c.muted)).padding([10, 10]));
+        }
+        let count: usize = groups.iter().map(|(_, l)| l.len()).sum();
+        let hint = if q.is_empty() {
+            format!("{count} directives available. Click one to add it with its default values.")
+        } else {
+            format!("{count} matching. Enter adds the exact or only match; with arguments typed, the text as written.")
+        };
         container(
             column![
-                text("Add to this block").font(style::SEMIBOLD),
                 row![
-                    pick_list(options, self.add_pick.clone(), Msg::AddPick)
-                        .placeholder("Choose a directive…")
-                        .text_size(13)
-                        .padding([6, 10])
-                        .style(style::select)
-                        .width(300),
-                    button(text("Add").size(13).font(style::SEMIBOLD))
-                        .padding([7, 16])
-                        .style(style::primary)
-                        .on_press_maybe(self.add_pick.is_some().then_some(Msg::Add)),
-                    Space::new().width(6),
-                    field_input("or type: name args, then Enter", &self.custom, false)
-                        .on_input(Msg::Custom)
-                        .on_submit(Msg::CustomSubmit)
-                        .width(Length::Fill),
-                    button(text("Add comment").size(13)).padding([7, 14]).style(style::secondary).on_press(Msg::AddComment),
+                    text("Add to this block").font(style::SEMIBOLD),
+                    Space::new().width(Length::Fill),
+                    button(text("Add comment").size(13)).padding([6, 12]).style(style::secondary).on_press(Msg::AddComment),
                 ]
-                .spacing(8)
                 .align_y(Alignment::Center),
-                text(help).size(12).color(c.muted),
+                field_input("Search directives, or type name and arguments", &self.query, false)
+                    .id(ADD)
+                    .on_input(Msg::AddQuery)
+                    .on_submit(Msg::AddSubmit)
+                    .padding([8, 12])
+                    .width(Length::Fill),
+                container(scrollable(list).height(Length::Shrink))
+                    .max_height(300)
+                    .padding(4)
+                    .style(style::well),
+                text(hint).size(12).color(c.muted),
             ]
             .spacing(10),
         )
@@ -1069,6 +1161,8 @@ const NONE: &str = "—";
 const PANE: &str = "pane";
 /// The field of the comment being edited, focused when editing starts.
 const COMMENT: &str = "comment";
+/// The search box of the "add" card.
+const ADD: &str = "add";
 
 fn split(ip: &[usize]) -> (&[usize], usize) {
     match ip.split_last() {
