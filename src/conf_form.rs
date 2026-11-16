@@ -343,6 +343,44 @@ pub fn split_param(kv: &str) -> (&str, &str) {
     kv.split_once('=').unwrap_or((kv, ""))
 }
 
+/// One box of a multi-choice field: a plain option, or an option with a
+/// value (`ipv6only=on` / `ipv6only=off`) shown as one box and a value.
+#[derive(Debug, PartialEq)]
+pub enum ChoiceBox {
+    Plain(String),
+    Switch { key: String, values: Vec<String> },
+}
+
+/// The boxes for the options `known` of a multi-choice field holding
+/// `cur`: options sharing a `key=` become one switch, and values of the
+/// field that are not known come last as plain boxes (or join their
+/// switch's values).
+pub fn choice_boxes(known: &[&str], cur: &[String]) -> Vec<ChoiceBox> {
+    let mut out: Vec<ChoiceBox> = Vec::new();
+    let all = known.iter().map(|s| s.to_string()).chain(cur.iter().filter(|c| !known.contains(&c.as_str())).cloned());
+    for o in all {
+        match o.split_once('=') {
+            Some((k, v)) => {
+                let found = out.iter_mut().find_map(|b| match b {
+                    ChoiceBox::Switch { key, values } if key == k => Some(values),
+                    _ => None,
+                });
+                match found {
+                    Some(values) => values.push(v.to_string()),
+                    None => out.push(ChoiceBox::Switch { key: k.to_string(), values: vec![v.to_string()] }),
+                }
+            }
+            None => out.push(ChoiceBox::Plain(o)),
+        }
+    }
+    out
+}
+
+/// Whether two options set the same `key=` (so only one of them may be on).
+pub fn same_key(a: &str, b: &str) -> bool {
+    matches!((a.split_once('='), b.split_once('=')), (Some((x, _)), Some((y, _))) if x == y)
+}
+
 /// Whether `s` is a valid value for a field of kind `kind` (empty fields
 /// are not checked here).
 pub fn valid(kind: &Kind, s: &str) -> bool {
@@ -679,6 +717,12 @@ http {
         // address + repeated options
         let sp = spec("listen", "server");
         assert_eq!(assign(&sp, &s(&["1935", "ipv6only=on"])), vec![Val::One("1935".into()), Val::Many(s(&["ipv6only=on"]))]);
+        let sw = |k: &str, v: &[&str]| ChoiceBox::Switch { key: k.into(), values: s(v) };
+        assert_eq!(
+            choice_boxes(&["ssl", "ipv6only=on", "ipv6only=off"], &s(&["ipv6only=off", "so_keepalive=1m::5"])),
+            vec![ChoiceBox::Plain("ssl".into()), sw("ipv6only", &["on", "off"]), sw("so_keepalive", &["1m::5"])]
+        );
+        assert!(same_key("ipv6only=on", "ipv6only=off") && !same_key("ssl", "ssl") && !same_key("a=1", "b=1"));
         // choices that are not repeated
         let sp = spec("record", "recorder");
         assert_eq!(assign(&sp, &s(&["audio", "keyframes"])), vec![Val::Many(s(&["audio", "keyframes"]))]);

@@ -278,7 +278,7 @@ impl Editor {
             Msg::Toggle(ip, n, value, on) => self.edit_vals(&ip, |spec, vals| {
                 let Kind::Choices(known) = spec.args[n].kind else { return };
                 let mut cur = vals[n].as_list();
-                cur.retain(|v| v != &value);
+                cur.retain(|v| v != &value && !form::same_key(v, &value));
                 if on {
                     cur.push(value);
                 }
@@ -1117,15 +1117,35 @@ impl Editor {
         };
         match (&a.kind, v) {
             (Kind::Choices(known), Val::Many(cur)) => {
-                let mut boxes = row![].spacing(14);
-                let extra = cur.iter().filter(|c| !known.contains(&c.as_str())).cloned();
-                for o in known.iter().map(|s| s.to_string()).chain(extra) {
-                    let on = cur.contains(&o);
-                    let ip = ip.clone();
-                    let value = o.clone();
-                    boxes = boxes.push(
-                        checkbox(on).label(o).size(16).text_size(13).on_toggle(move |b| Msg::Toggle(ip.clone(), n, value.clone(), b)),
-                    );
+                let mut boxes = row![].spacing(14).align_y(Alignment::Center);
+                for b in form::choice_boxes(known, cur) {
+                    match b {
+                        form::ChoiceBox::Plain(o) => {
+                            let on = cur.contains(&o);
+                            let ip = ip.clone();
+                            boxes = boxes.push(
+                                checkbox(on).label(o.clone()).size(16).text_size(13).on_toggle(move |b| Msg::Toggle(ip.clone(), n, o.clone(), b)),
+                            );
+                        }
+                        form::ChoiceBox::Switch { key, values } => {
+                            let set = cur.iter().find_map(|c| c.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()));
+                            let (ip1, ip2) = (ip.clone(), ip.clone());
+                            let k2 = key.clone();
+                            let first = format!("{key}={}", values[0]);
+                            let now = set.as_ref().map(|v| format!("{key}={v}")).unwrap_or_else(|| first.clone());
+                            let mut r = row![checkbox(set.is_some())
+                                .label(key)
+                                .size(16)
+                                .text_size(13)
+                                .on_toggle(move |b| Msg::Toggle(ip1.clone(), n, if b { first.clone() } else { now.clone() }, b))]
+                            .spacing(6)
+                            .align_y(Alignment::Center);
+                            if let Some(v) = set {
+                                r = r.push(select(values, Some(v), move |v| Msg::Toggle(ip2.clone(), n, format!("{k2}={v}"), true)));
+                            }
+                            boxes = boxes.push(r);
+                        }
+                    }
                 }
                 boxes.wrap().vertical_spacing(6).into()
             }

@@ -148,7 +148,7 @@ pub fn specs() -> Vec<Spec> {
             .0,
         B::new("listen", "core", SRV, "Address to accept RTMP connections on; add ssl for RTMPS.")
             .arg(a("address", Kind::Addr))
-            .arg(rep("options", Kind::Choices(&["ssl", "bind", "ipv6only=on", "ipv6only=off", "so_keepalive=on"])))
+            .arg(rep("options", Kind::Choices(&["ssl", "bind", "ipv6only=on", "ipv6only=off", "so_keepalive=on", "so_keepalive=off"])))
             .def("1935")
             .multi()
             .0,

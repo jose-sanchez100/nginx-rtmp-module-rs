@@ -328,11 +328,33 @@ function argWidgets(box, it, spec) {
       const cur = new Set(vals[n]);
       box.append(lab);
       const extra = vals[n].filter((v) => !a.kind.values.includes(v));
-      for (const o of a.kind.values.concat(extra)) {
-        const cb = el("input", { type: "checkbox", checked: cur.has(o), onchange: (e) => {
-          if (e.target.checked) cur.add(o); else cur.delete(o);
-          vals[n] = a.kind.values.concat(extra).filter((v) => cur.has(v)); update(); } });
-        box.append(el("label", { class: "chk" }, cb, o));
+      const all = a.kind.values.concat(extra);
+      const keyOf = (v) => (v.includes("=") ? v.split("=")[0] : null);
+      const save = () => { vals[n] = all.filter((v) => cur.has(v)); update(); };
+      const done = new Set();
+      for (const o of all) {
+        const key = keyOf(o);
+        if (key === null) {
+          const cb = el("input", { type: "checkbox", checked: cur.has(o), onchange: (e) => {
+            if (e.target.checked) cur.add(o); else cur.delete(o); save(); } });
+          box.append(el("label", { class: "chk" }, cb, o));
+          continue;
+        }
+        // key=on / key=off: one box, and the value next to it
+        if (done.has(key)) continue;
+        done.add(key);
+        const group = all.filter((v) => keyOf(v) === key);
+        const now = group.find((v) => cur.has(v));
+        const sel = el("select", { title: key, onchange: (e) => {
+          group.forEach((v) => cur.delete(v)); cur.add(e.target.value); save(); } });
+        for (const v of group) sel.append(el("option", { value: v }, v.slice(key.length + 1)));
+        sel.value = now || group[0];
+        sel.hidden = !now;
+        const cb = el("input", { type: "checkbox", checked: !!now, onchange: (e) => {
+          group.forEach((v) => cur.delete(v));
+          if (e.target.checked) cur.add(group[0]);
+          sel.value = group[0]; sel.hidden = !e.target.checked; save(); } });
+        box.append(el("label", { class: "chk" }, cb, key, sel));
       }
     } else if (t === "param") {
       box.append(lab);
