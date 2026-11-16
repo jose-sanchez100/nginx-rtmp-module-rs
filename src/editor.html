@@ -460,11 +460,9 @@ async function save(force) {
 $("#tab-form").onclick = () => setMode("form");
 $("#tab-text").onclick = () => setMode("text");
 $("#text").addEventListener("input", () => setDirty(true));
-// In the app window (WebView2) the window asks before closing with unsaved changes.
 function setDirty(v) {
   dirty = v;
   $("#title").classList.toggle("dirty", v);
-  if (window.ipc) window.ipc.postMessage(v ? "dirty" : "clean");
 }
 $("#text").addEventListener("keydown", (e) => {
   if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("    ", s, t.selectionEnd, "end"); }

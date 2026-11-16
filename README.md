@@ -46,8 +46,8 @@ The binary is `target/release/nginx` (`nginx.exe` on Windows).
 nginx [-p prefix] [-c nginx.conf] [-t] [-e] [-s stop|quit|reload]
 ```
 
-`-e` opens the configuration editor in a window (WebView2; the browser where it is
-not available); `-s reload` applies a changed
+`-e` opens the configuration editor in a window (on Windows; a page in the browser
+elsewhere); `-s reload` applies a changed
 `nginx.conf` to the running server, keeping current connections.
 
 The prefix defaults to the executable's directory and the configuration to

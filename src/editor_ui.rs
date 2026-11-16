@@ -3,7 +3,7 @@
 //! iced has to run on a process's main thread and only once per process,
 //! so the window is a process of its own: `nginx.exe --editor-ui`, started
 //! by [`open`]. It reads the editor's address (token included) from its
-//! standard input and talks to the editor API served by [`crate::editor`]
+//! standard input and talks to the editor API served by [`nginx_rtmp::editor`]
 //! in the parent. It ends when the window is closed, or when its standard
 //! input closes because the parent has exited.
 //!

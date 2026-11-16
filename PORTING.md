@@ -137,11 +137,16 @@ elsewhere), so an existing `stop.bat` keeps working.
 ### Configuration editor (not in nginx)
 
 `nginx -e`, or "Configure…" in the tray menu, opens `nginx.conf` in a window of the
-application (`src/editor_window.rs`: the page in a WebView2 control, with the browser as
-the fallback when the WebView2 runtime is missing and on other systems). The page
-(`src/editor.rs`, `src/editor.html`) is served on 127.0.0.1 with a random token in the
-URL. Closing the window with unsaved changes asks first; with `-e` the program ends when
-the window is closed. WebView2 keeps its data in `%LOCALAPPDATA%\nginx-rtmp-module-rs`.
+application on Windows, drawn with [iced](https://iced.rs) (`src/editor_ui.rs`,
+`src/editor_ui/`). iced must run on a process's main thread and only once per process,
+so the window is a process of its own, `nginx.exe --editor-ui`: it reads the editor's
+address from its standard input, loads, saves and reloads through the editor API
+(`src/editor.rs`, served on 127.0.0.1 with a random token in the URL) and checks the
+text in-process with the same logic (`src/conf_form.rs`). It ends when the window is
+closed or when the program that started it exits; opening it again brings the open
+window to the front. Closing it with unsaved changes asks first; with `-e` the program
+ends when the window is closed. Elsewhere, or if the window cannot be opened, the same
+editor is shown as a web page in the browser (`src/editor.html`).
 
 - A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
   `location`) and, for the selected one, a form with every directive: on/off
