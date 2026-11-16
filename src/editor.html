@@ -70,8 +70,25 @@ h2 { margin: 0 0 4px; font-size: 18px; display: flex; gap: 8px; align-items: cen
 .badge { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--code); color: var(--muted); font-weight: normal; }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .add { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.add select { background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; max-width: 360px; }
-.add .addhelp { color: var(--muted); flex-basis: 100%; }
+.addcard { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; }
+.addcard h3 { margin: 0; align-items: center; }
+.addcard h3 .grow { flex: 1; }
+.addcard h3 button { font-weight: normal; font-size: 13px; }
+.addcard .recipes { margin-top: 0; }
+.addcard input.search { width: 100%; background: var(--input); border: 1px solid var(--line); border-radius: 6px; padding: 7px 11px; }
+.addcard input.search:focus { outline: none; border-color: var(--accent); }
+.well { max-height: 300px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px; }
+.well .module { text-transform: uppercase; font-size: 11px; font-weight: 600; color: var(--muted); padding: 8px 10px 2px; }
+.well .entry { display: flex; width: 100%; gap: 12px; align-items: center; text-align: left; border: 0; background: none; padding: 6px 10px; border-radius: 5px; }
+.well .entry:hover, .well .entry:focus { background: var(--hover); outline: none; }
+.well .entry code { flex: none; width: 220px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.well .entry .brace { color: var(--muted); }
+.well .entry .desc { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.well .entry.written .lbl { color: var(--muted); font-size: 13px; }
+.well .entry.written code { width: auto; flex: 1; }
+.well .entry kbd { font: 11px system-ui, sans-serif; color: var(--muted); }
+.well .empty { color: var(--muted); padding: 10px; }
+.addhint { color: var(--muted); font-size: 12px; }
 #text-view { flex: 1; min-height: 0; padding: 12px 16px; box-sizing: border-box; }
 textarea#text { box-sizing: border-box; width: 100%; height: 100%; resize: none; font: 13px/1.45 ui-monospace, Consolas, monospace; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 12px; tab-size: 4; }
 footer { flex: none; background: var(--panel); border-top: 1px solid var(--line); padding: 6px 16px; font-size: 13px; max-height: 30vh; overflow: auto; }
@@ -247,7 +264,7 @@ function renderPane() {
   items.forEach((it, i) => rows.append(row(it, i, items, ctx)));
   if (!items.length) rows.append(el("div", { class: "row" }, el("span", { class: "help" }, "Empty block."), el("span"), el("span")));
   pane.append(rows);
-  pane.append(slots.inherited, slots.recipes);
+  pane.append(slots.inherited);
   pane.append(addBar(items, ctx));
   fetchHelp();
   if (self && ctx !== "main") {
@@ -438,22 +455,41 @@ function insertDir(items, it) {
   return at;
 }
 
-function addBar(items, ctx) {
+// The directives `items` (a block in context `ctx`) accepts that match
+// the search `query`, by module: names that start with the word, then
+// names that contain it, then descriptions that contain the search;
+// with arguments typed, only the exact name.
+function searchSpecs(items, ctx, query) {
   const present = new Set(items.filter((d) => d.t === "dir").map((d) => d.name));
   const avail = schema.filter((s) => s.ctx.includes(ctx) && (s.multi || !present.has(s.name)));
-  const sel = el("select", {});
-  sel.append(el("option", { value: "" }, avail.length ? "Add a directive…" : "Add a directive (name)…"));
-  const groups = {};
-  for (const s of avail) (groups[s.module] = groups[s.module] || []).push(s);
-  for (const [m, list] of Object.entries(groups)) {
-    const g = el("optgroup", { label: m });
-    for (const s of list) g.append(el("option", { value: s.name }, s.name + (s.block ? " { }" : "")));
-    sel.append(g);
+  const q = query.trim().toLowerCase(), word = q.split(/\s+/)[0] || "", args = /\s/.test(q);
+  const tier = (s) => {
+    if (!word) return 0;
+    if (args) return s.name === word ? 0 : -1;
+    if (s.name.startsWith(word)) return 0;
+    if (s.name.includes(word)) return 1;
+    return s.help.toLowerCase().includes(q) ? 2 : -1;
+  };
+  const groups = [];
+  for (let t = 0; t < 3; t++) {
+    for (const s of avail) {
+      if (tier(s) !== t) continue;
+      let g = groups.find((g) => g.module === s.module);
+      if (!g) groups.push((g = { module: s.module, specs: [] }));
+      g.specs.push(s);
+    }
   }
-  const help = el("span", { class: "addhelp" });
-  sel.onchange = () => { const s = specFor(sel.value, ctx); help.textContent = s ? s.help + (s.default ? ` Default: ${s.default}.` : "") : ""; };
-  const add = () => {
-    const s = specFor(sel.value, ctx); if (!s) return;
+  return groups;
+}
+
+// `name args` typed by hand (a trailing ";" is allowed).
+function parseCustom(text) {
+  const w = splitArgs(text.trim().replace(/;$/, ""));
+  return w.length && w[0] ? { t: "dir", name: w[0], args: w.slice(1), line: 0 } : null;
+}
+
+function addBar(items, ctx) {
+  const add = (s) => {
     const args = [];
     for (const a of s.args) {
       if (a.opt) continue;
@@ -469,13 +505,56 @@ function addBar(items, ctx) {
     if (s.block && !s.args.some((a) => !a.opt)) { select(path.concat(at)); return; }
     renderAll();
   };
-  const custom = el("input", { type: "text", placeholder: "or type: name args", size: 22, onkeydown: (e) => {
-    if (e.key !== "Enter" || !e.target.value.trim()) return;
-    const w = splitArgs(e.target.value.trim().replace(/;$/, ""));
-    items.push({ t: "dir", name: w[0], args: w.slice(1), line: 0 }); changed(); renderAll(); } });
-  return el("div", { class: "add" }, sel, el("button", { onclick: add }, "Add"),
-    el("button", { onclick: () => { items.push({ t: "comment", text: " " }); changed(); renderAll(); } }, "Add comment"),
-    custom, help);
+  const addWritten = () => {
+    const it = parseCustom(search.value);
+    if (it) { insertDir(items, it); changed(); renderAll(); }
+  };
+  const search = el("input", { type: "search", class: "search", placeholder: "Search directives, or type name and arguments", autocomplete: "off", spellcheck: "false" });
+  const list = el("div", { class: "well" });
+  const hint = el("div", { class: "addhint" });
+  const draw = () => {
+    const q = search.value.trim(), groups = searchSpecs(items, ctx, search.value), typedArgs = /\s/.test(q);
+    list.textContent = "";
+    if (parseCustom(q) && (!groups.length || typedArgs)) {
+      list.append(el("button", { class: "entry written", onclick: addWritten },
+        el("span", { class: "lbl" }, "Add as written:"), el("code", {}, q.replace(/;$/, "") + ";"), el("kbd", {}, "Enter")));
+    }
+    for (const g of groups) {
+      list.append(el("div", { class: "module" }, g.module));
+      for (const s of g.specs) {
+        list.append(el("button", { class: "entry", title: s.help + (s.default ? ` Default: ${s.default}.` : ""), onclick: () => add(s) },
+          el("code", {}, el("b", {}, s.name), s.block ? el("span", { class: "brace" }, " { }") : null),
+          el("span", { class: "desc" }, s.help)));
+      }
+    }
+    if (!groups.length && !typedArgs) {
+      list.append(el("div", { class: "empty" }, q ? `No known directive matches "${q}".` : "Every directive this block accepts is already here."));
+    }
+    const count = groups.reduce((n, g) => n + g.specs.length, 0);
+    hint.textContent = q ? `${count} matching. Enter adds the exact or only match; with arguments typed, the text as written.`
+      : `${count} directives available. Click one to add it with its default values.`;
+  };
+  search.addEventListener("input", draw);
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { search.value = ""; draw(); return; }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const q = search.value.trim().replace(/;$/, "").trim();
+    if (!q) return;
+    const found = searchSpecs(items, ctx, q).flatMap((g) => g.specs);
+    if (!/\s/.test(q)) {
+      // a bare known name, or the only match of a search word
+      const known = found.find((s) => s.name === q) || (found.length === 1 ? found[0] : null);
+      if (known) { add(known); return; }
+      if (found.length) return; // several matches: wait for a click
+    }
+    addWritten();
+  });
+  draw();
+  return el("div", { class: "card addcard" },
+    el("h3", {}, "Add to this block", el("span", { class: "grow" }),
+      el("button", { onclick: () => { items.push({ t: "comment", text: " " }); changed(); renderAll(); } }, "Add comment")),
+    slots.recipes, search, list, hint);
 }
 
 // ---------- help ----------
