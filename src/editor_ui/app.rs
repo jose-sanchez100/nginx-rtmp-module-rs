@@ -905,21 +905,21 @@ impl Editor {
             }
             Item::Dir { name, args, .. } => {
                 let spec = form::spec_for(&self.specs, name, ctx);
-                let label = column![
-                    text(name.as_str()).font(style::SEMIBOLD),
-                    text(spec.map_or("unknown", |s| s.module)).size(12).color(c.muted),
-                ]
-                .spacing(2)
-                .width(190);
+                let unknown = form::unknown(ctx);
+                let sub: Element<'_, Msg> = match spec {
+                    Some(s) => text(s.module).size(12).color(c.muted).into(),
+                    None => {
+                        let badge = pill(unknown.label, if unknown.warn { style::pill_warn } else { style::pill_muted });
+                        row![with_tip(badge, unknown.help)].into()
+                    }
+                };
+                let label = column![text(name.as_str()).font(style::SEMIBOLD), sub].spacing(4).width(190);
                 let body: Element<'_, Msg> = match spec {
                     Some(s) => {
                         let note = if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) };
                         column![self.fields(ip.clone(), s, args), text(note).size(12).color(c.muted)].spacing(6).into()
                     }
-                    None => row![self.generic(ip.clone(), it), pill("not used by this server", style::pill_warn)]
-                        .spacing(10)
-                        .align_y(Alignment::Center)
-                        .into(),
+                    None => column![self.generic(ip.clone(), it), text(unknown.help).size(12).color(c.muted)].spacing(6).into(),
                 };
                 let disable = icon("⊘", "Disable (comment out)", Some(Msg::Disable(ip.clone())));
                 container(
@@ -1180,7 +1180,7 @@ fn vline<'a>() -> Element<'a, Msg> {
 }
 
 fn pill<'a>(s: impl Into<String>, st: fn(&Theme) -> container::Style) -> Element<'a, Msg> {
-    container(text(s.into()).size(11).font(style::SEMIBOLD)).padding([2, 9]).style(st).into()
+    container(text(s.into()).size(11).font(style::SEMIBOLD).wrapping(text::Wrapping::None)).padding([2, 9]).style(st).into()
 }
 
 fn tip<'a>(s: &'a str) -> Element<'a, Msg> {

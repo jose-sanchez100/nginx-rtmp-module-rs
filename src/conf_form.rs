@@ -29,6 +29,34 @@ pub fn inner_ctx(name: &str, ctx: &str) -> &'static str {
     }
 }
 
+/// How a directive this server does not know is shown, by where it is.
+pub struct Unknown {
+    /// Short label for the badge.
+    pub label: &'static str,
+    pub help: &'static str,
+    /// Worth a warning: probably a typo or a feature not ported yet.
+    pub warn: bool,
+}
+
+/// Outside `rtmp {}` an unknown directive is an nginx one (`worker_processes`,
+/// `events {}`, most of `http {}`) that has no effect here; inside, it is
+/// probably misspelled or not implemented.
+pub fn unknown(ctx: &str) -> Unknown {
+    if matches!(ctx, "rtmp" | "server" | "application" | "recorder") {
+        Unknown {
+            label: "not supported",
+            help: "This server ignores this directive. Check the spelling, or it may not be implemented yet.",
+            warn: true,
+        }
+    } else {
+        Unknown {
+            label: "nginx only",
+            help: "Not used by this server. Kept so the file also works with nginx.",
+            warn: false,
+        }
+    }
+}
+
 /// How a context is named on screen.
 pub fn ctx_label(ctx: &str) -> &str {
     match ctx {
@@ -763,5 +791,14 @@ http {
         assert!(!bad.ok);
         assert_eq!(check_messages(&bad, false)[0].0, Level::Err);
         assert_eq!(serde_json::to_value(&bad).unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn unknown_by_place() {
+        assert!(!unknown("main").warn);
+        assert!(!unknown("other").warn);
+        assert!(!unknown("location").warn);
+        assert!(unknown("application").warn);
+        assert!(unknown("rtmp").warn);
     }
 }
