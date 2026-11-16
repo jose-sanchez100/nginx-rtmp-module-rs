@@ -50,7 +50,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-wry = { version = "0.57.2", default-features = false }
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "thread-pool"] }
 
 [dev-dependencies]
 serde_json = "1.0.154"

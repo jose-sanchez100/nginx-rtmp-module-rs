@@ -1,5 +1,5 @@
 //! Interactive `nginx.conf` editor: a web page served on 127.0.0.1, shown
-//! in the application's window on Windows (`editor_window.rs`) or a browser.
+//! in the application's window on Windows (`editor_ui.rs`) or a browser.
 //!
 //! The page (`editor.html`) shows the configuration as a tree of blocks
 //! with a form for each directive, built from [`crate::conf_schema`], and

@@ -1,6 +1,6 @@
 mod daemon;
 #[cfg(windows)]
-mod editor_window;
+mod editor_ui;
 #[cfg(windows)]
 mod tray;
 
@@ -39,8 +39,22 @@ Console output, when started from a terminal, is controlled by RUST_LOG
 const DEFAULT_ERROR_LOG: &str = "logs/error.log";
 const DEFAULT_PID: &str = "logs/nginx.pid";
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // The editor's window: a process of its own, see editor_ui.rs.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some(editor_ui::FLAG) {
+        return editor_ui::run();
+    }
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(serve()),
+        Err(e) => {
+            eprintln!("nginx: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn serve() -> ExitCode {
     let mut conf_arg: Option<PathBuf> = None;
     let mut prefix_arg: Option<PathBuf> = None;
     let mut test_only = false;
@@ -279,21 +293,18 @@ async fn open_editor(editor: &mut Option<editor::Running>, conf_path: &Path, app
     show_editor(&url).await.map(drop)
 }
 
-/// The editor's window thread, `None` when an open window was brought to
-/// the front or the page went to the browser.
-type Shown = Option<std::thread::JoinHandle<()>>;
-
-async fn show_editor(url: &str) -> Result<Shown, String> {
+/// Whether the editor is shown in its window (`false`: in the browser).
+async fn show_editor(url: &str) -> Result<bool, String> {
     #[cfg(windows)]
     {
         let u = url.to_string();
-        match tokio::task::spawn_blocking(move || editor_window::open(&u)).await {
-            Ok(Ok(shown)) => return Ok(shown),
+        match tokio::task::spawn_blocking(move || editor_ui::open(&u)).await {
+            Ok(Ok(())) => return Ok(true),
             Ok(Err(e)) => tracing::warn!("editor window: {e}; using the browser"),
             Err(e) => tracing::warn!("editor window: {e}; using the browser"),
         }
     }
-    if daemon::open_browser(url) { Ok(None) } else { Err(format!("open {url} in a browser")) }
+    if daemon::open_browser(url) { Ok(false) } else { Err(format!("open {url} in a browser")) }
 }
 
 /// `-e`: edit the configuration without starting a server; saving sends
@@ -323,16 +334,25 @@ async fn edit_standalone(prefix: PathBuf, conf_path: PathBuf) -> ExitCode {
     println!("nginx: editing {}", conf_path.display());
     match show_editor(&running.url).await {
         // Done when the window is closed.
-        Ok(Some(window)) => {
+        #[cfg(windows)]
+        Ok(true) => {
             tokio::select! {
-                _ = tokio::task::spawn_blocking(move || window.join()) => {}
-                _ = tokio::signal::ctrl_c() => {}
+                _ = tokio::task::spawn_blocking(editor_ui::wait) => {}
+                _ = ctrl_c() => {}
             }
         }
         _ => {
             println!("nginx: open {} (Ctrl+C to quit)", running.url);
-            let _ = tokio::signal::ctrl_c().await;
+            ctrl_c().await;
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Ctrl+C; never, when there is no console to press it in (waiting for
+/// it would otherwise end at once).
+async fn ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
