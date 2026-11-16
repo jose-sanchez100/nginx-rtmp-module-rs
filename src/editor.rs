@@ -247,10 +247,7 @@ impl Editor {
 
     /// What the server would say about `text`.
     fn check(&self, text: &str) -> Value {
-        match crate::config::Config::parse(text, &file_name(&self.conf_path)) {
-            Ok(c) => json!({ "ok": true, "warnings": c.warnings }),
-            Err(e) => json!({ "ok": false, "error": e.to_string() }),
-        }
+        json!(crate::conf_form::Check::of(text, &file_name(&self.conf_path)))
     }
 
     async fn save(&self, body: &Value) -> Reply {
