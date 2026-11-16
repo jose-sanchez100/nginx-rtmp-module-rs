@@ -146,7 +146,8 @@ text in-process with the same logic (`src/conf_form.rs`). It ends when the windo
 closed or when the program that started it exits; opening it again brings the open
 window to the front. Closing it with unsaved changes asks first; with `-e` the program
 ends when the window is closed. Elsewhere, or if the window cannot be opened, the same
-editor is shown as a web page in the browser (`src/editor.html`).
+editor is shown as a web page in the browser (`src/editor.html`). The window is light or
+dark like Windows' app mode; `NGINX_EDITOR_THEME=light` or `dark` picks one.
 
 - A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
   `location`) and, for the selected one, a form with every directive: on/off

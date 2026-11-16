@@ -18,6 +18,7 @@ use std::time::Duration;
 
 mod api;
 mod app;
+mod style;
 
 /// Hidden command-line flag that runs the window.
 pub const FLAG: &str = "--editor-ui";

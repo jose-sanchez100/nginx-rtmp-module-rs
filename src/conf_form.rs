@@ -440,13 +440,33 @@ pub fn parse_custom(text: &str) -> Option<Item> {
     Some(dir(&name, w, None))
 }
 
-/// Move item `i` of `items` by one place up (`-1`) or down (`1`).
-pub fn move_item(items: &mut [Item], i: usize, delta: isize) -> bool {
-    let j = i as isize + delta;
-    if j < 0 || j as usize >= items.len() || i >= items.len() {
-        return false;
+/// Where item `i` goes when moved one place up (`-1`) or down (`1`):
+/// past the next item that is not a blank line (blank lines are not
+/// shown by the editor).
+fn move_target(items: &[Item], i: usize, delta: isize) -> Option<usize> {
+    if i >= items.len() {
+        return None;
     }
-    items.swap(i, j as usize);
+    let mut j = i as isize;
+    loop {
+        j += delta;
+        let k = usize::try_from(j).ok().filter(|&k| k < items.len())?;
+        if !matches!(items[k], Item::Blank) {
+            return Some(k);
+        }
+    }
+}
+
+/// Whether item `i` can move by `delta` (see [`move_item`]).
+pub fn can_move(items: &[Item], i: usize, delta: isize) -> bool {
+    move_target(items, i, delta).is_some()
+}
+
+/// Move item `i` one place up (`-1`) or down (`1`), over blank lines.
+pub fn move_item(items: &mut Vec<Item>, i: usize, delta: isize) -> bool {
+    let Some(j) = move_target(items, i, delta) else { return false };
+    let it = items.remove(i);
+    items.insert(j, it);
     true
 }
 
@@ -710,8 +730,16 @@ http {
         assert!(!move_item(&mut items, 0, -1));
         assert!(!move_item(&mut items, 2, 1));
         assert!(matches!(&items[0], Item::Dir { name, .. } if name == "b"));
-
         let mut d = items[1].clone();
+        // blank lines are passed over and stay where they are
+        let mut blanks = parse("a 1;\n\nb 2;\n").unwrap();
+        assert_eq!(blanks.len(), 3);
+        assert!(can_move(&blanks, 0, 1) && !can_move(&blanks, 0, -1) && !can_move(&blanks, 2, 1));
+        assert!(move_item(&mut blanks, 0, 1));
+        assert!(matches!(&blanks[1], Item::Dir { name, .. } if name == "b"));
+        assert!(matches!(&blanks[2], Item::Dir { name, .. } if name == "a"));
+        assert!(matches!(&blanks[0], Item::Blank));
+
         set_args(&mut d, s(&["x y"]));
         assert!(matches!(&d, Item::Dir { raw: None, .. }));
         let c = disable(&d).unwrap();

@@ -3,6 +3,7 @@
 //! (`editor.html`), drawn with iced.
 
 use super::api::{Api, Content, Loaded, Saved};
+use super::style;
 use iced::widget::{
     Space, button, checkbox, column, container, opaque, pick_list, row, rule, scrollable, stack, text, text_editor,
     text_input, tooltip,
@@ -55,6 +56,8 @@ enum Msg {
     ParamRemove(ItemPath, usize, usize),
     Generic(ItemPath, String),
     CommentText(ItemPath, String),
+    /// Start (`Some`) or stop editing a comment.
+    EditComment(Option<ItemPath>),
     // rows
     Move(ItemPath, isize),
     Delete(ItemPath),
@@ -111,12 +114,15 @@ struct Editor {
     /// Text typed in fields that hold several arguments, kept as typed
     /// (re-joining the arguments would eat a trailing space).
     drafts: HashMap<(ItemPath, usize), String>,
+    /// The comment being edited.
+    editing: Option<ItemPath>,
 }
 
 /// Field number of the plain "arguments" field of unknown directives.
 const GENERIC: usize = usize::MAX;
 
 pub fn run(api: Api) -> iced::Result {
+    let theme = style::init();
     iced::application(
         move || {
             let e = Editor::new(api.clone());
@@ -126,6 +132,8 @@ pub fn run(api: Api) -> iced::Result {
         Editor::update,
         Editor::view,
     )
+    .settings(iced::Settings { default_text_size: 14.into(), ..iced::Settings::default() })
+    .theme(theme)
     .title(Editor::title)
     .subscription(Editor::subscription)
     .exit_on_close_request(false)
@@ -160,6 +168,7 @@ impl Editor {
             add_pick: None,
             custom: String::new(),
             drafts: HashMap::new(),
+            editing: None,
         }
     }
 
@@ -254,8 +263,10 @@ impl Editor {
             }
             Msg::Select(p) => {
                 self.sel = p;
+                self.editing = None;
                 self.drafts.clear();
                 self.add_pick = None;
+                return iced::widget::operation::snap_to(PANE, iced::widget::operation::RelativeOffset::START);
             }
             Msg::SetMode(m) => self.set_mode(m),
             Msg::SetOne(ip, n, v) => self.edit_vals(&ip, |_, vals| vals[n] = Val::One(v)),
@@ -309,6 +320,13 @@ impl Editor {
                 let args = form::split_args(&v);
                 self.drafts.insert((ip.clone(), GENERIC), v);
                 self.with_item(&ip, |it| form::set_args(it, args));
+            }
+            Msg::EditComment(ip) => {
+                let start = ip.is_some();
+                self.editing = ip;
+                if start {
+                    return iced::widget::operation::focus(COMMENT);
+                }
             }
             Msg::CommentText(ip, v) => self.with_item(&ip, |it| {
                 if let Item::Comment { text } = it {
@@ -489,6 +507,7 @@ impl Editor {
     /// After items of the block at `parent` were added, moved or removed.
     fn structure_changed(&mut self, parent: Vec<usize>) {
         self.drafts.clear();
+        self.editing = None;
         if self.sel.len() > parent.len() && self.sel.starts_with(&parent) {
             self.sel = parent;
         }
@@ -538,11 +557,18 @@ impl Editor {
     // ------------------------------------------------------------- view
 
     fn view(&self) -> Element<'_, Msg> {
+        let c = style::colors();
         let body: Element<'_, Msg> = match self.mode {
             Mode::Form => row![
-                container(scrollable(self.tree_view()).height(Length::Fill)).width(270).height(Length::Fill),
-                rule::vertical(1),
-                scrollable(container(self.pane()).padding([16, 20])).width(Length::Fill).height(Length::Fill),
+                container(scrollable(self.tree_view()).height(Length::Fill))
+                    .width(250)
+                    .height(Length::Fill)
+                    .style(style::sidebar),
+                vline(),
+                scrollable(container(self.pane()).padding([20, 28]).max_width(1040))
+                    .id(PANE)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
             ]
             .height(Length::Fill)
             .into(),
@@ -550,14 +576,25 @@ impl Editor {
                 text_editor(&self.content)
                     .on_action(Msg::Edit)
                     .font(Font::MONOSPACE)
+                    .size(13)
                     .height(Length::Fill)
-                    .padding(10),
+                    .padding(14)
+                    .style(move |t, s| {
+                        let mut st = text_editor::default(t, s);
+                        st.background = c.surface.into();
+                        st.border = Border { radius: 10.0.into(), width: 1.0, color: c.border };
+                        st.selection = Color { a: 0.3, ..c.accent };
+                        st
+                    }),
             )
-            .padding([12, 16])
+            .padding([16, 20])
             .height(Length::Fill)
             .into(),
         };
-        let page = column![self.header(), rule::horizontal(1), body, rule::horizontal(1), self.footer()];
+        let page = container(column![self.header(), hline(), body, hline(), self.footer()])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(style::page);
         // Always a stack, so the page keeps its place (and its scroll
         // position) when a dialog opens over it.
         let mut layers = stack![page];
@@ -568,81 +605,90 @@ impl Editor {
     }
 
     fn header(&self) -> Element<'_, Msg> {
+        let c = style::colors();
         let tab = |label, m: Mode| {
-            button(text(label))
-                .style(if self.mode == m { button::primary } else { button::secondary })
-                .on_press(Msg::SetMode(m))
+            button(text(label).size(13)).padding([5, 14]).style(style::tab(self.mode == m)).on_press(Msg::SetMode(m))
         };
-        let title = if self.dirty { "nginx.conf •" } else { "nginx.conf" };
+        let mut title = row![text("nginx.conf").size(17).font(style::SEMIBOLD)].spacing(8).align_y(Alignment::Center);
+        if self.dirty {
+            title = title.push(pill("unsaved", style::pill_warn));
+        }
         // A long path is cut off rather than pushing the buttons out.
-        let name = column![
-            text(title).size(20),
-            text(&self.file).size(12).style(text::secondary).wrapping(text::Wrapping::None),
-        ];
-        row![
+        let name = column![title, text(&self.file).size(12).color(c.muted).wrapping(text::Wrapping::None)].spacing(2);
+        let bar = row![
             container(name).width(Length::Fill).clip(true),
-            row![tab("Form", Mode::Form), tab("Text", Mode::Text)].spacing(2),
-            Space::new().width(16),
-            tooltip(
-                button(text("Revert")).style(button::secondary).on_press_maybe(self.loaded.then_some(Msg::Revert)),
-                hint("Discard changes and load the file again"),
-                tooltip::Position::Bottom,
+            container(row![tab("Form", Mode::Form), tab("Text", Mode::Text)].spacing(2)).padding(3).style(style::segmented),
+            Space::new().width(8),
+            with_tip(
+                button(text("Revert").size(13))
+                    .padding([7, 14])
+                    .style(style::secondary)
+                    .on_press_maybe(self.loaded.then_some(Msg::Revert)),
+                "Discard changes and load the file again",
             ),
-            tooltip(
-                button(text("Reload server")).style(button::secondary).on_press(Msg::ReloadServer),
-                hint("Reload the file as it is on disk into the running server"),
-                tooltip::Position::Bottom,
+            with_tip(
+                button(text("Reload server").size(13)).padding([7, 14]).style(style::secondary).on_press(Msg::ReloadServer),
+                "Reload the file as it is on disk into the running server",
             ),
-            tooltip(
-                button(text(if self.busy { "Saving…" } else { "Save & reload" }))
-                    .style(button::primary)
+            with_tip(
+                button(text(if self.busy { "Saving…" } else { "Save & reload" }).size(13).font(style::SEMIBOLD))
+                    .padding([7, 16])
+                    .style(style::primary)
                     .on_press_maybe((!self.busy && self.loaded).then_some(Msg::Save)),
-                hint("Check, save and reload the running server (Ctrl+S)"),
-                tooltip::Position::Bottom,
+                "Check, save and reload the running server (Ctrl+S)",
             ),
         ]
-        .spacing(10)
+        .spacing(8)
         .align_y(Alignment::Center)
-        .padding([10, 16])
-        .into()
+        .padding([12, 20]);
+        container(bar).width(Length::Fill).style(style::bar).into()
     }
 
     fn footer(&self) -> Element<'_, Msg> {
+        let c = style::colors();
         let lines = self.status.iter().map(|(l, m)| {
-            let t = text(m.as_str()).size(13);
-            match l {
-                Level::Ok => t.style(text::success),
-                Level::Warn => t.style(text::warning),
-                Level::Err => t.style(text::danger),
-            }
-            .into()
+            let color = match l {
+                Level::Ok => c.success,
+                Level::Warn => c.warning,
+                Level::Err => c.danger,
+            };
+            row![text("●").size(10).color(color), text(m.as_str()).size(13)].spacing(8).align_y(Alignment::Center).into()
         });
-        container(scrollable(column(lines).spacing(2)).height(Length::Shrink))
-            .max_height(120)
-            .padding([8, 16])
+        container(scrollable(column(lines).spacing(4)).height(Length::Shrink))
+            .max_height(110)
+            .padding([9, 20])
             .width(Length::Fill)
+            .style(style::bar)
             .into()
     }
 
     fn tree_view(&self) -> Element<'_, Msg> {
+        let c = style::colors();
         let node = |depth: usize, name: String, detail: String, path: Vec<usize>| -> Element<'_, Msg> {
             let on = path == self.sel;
-            let detail = text(detail).size(13).wrapping(text::Wrapping::None);
-            let detail = if on {
-                detail.style(|t: &Theme| text::Style { color: Some(t.extended_palette().primary.base.text.scale_alpha(0.75)) })
-            } else {
-                detail.style(text::secondary)
-            };
             row![
                 Space::new().width((depth * 14) as f32),
-                button(row![text(name).wrapping(text::Wrapping::None), detail].spacing(6))
-                    .width(Length::Fill)
-                    .style(if on { button::primary } else { button::text })
-                    .on_press(Msg::Select(path)),
+                button(
+                    row![
+                        text(name).size(14).wrapping(text::Wrapping::None),
+                        text(detail).size(12).color(if on { c.accent } else { c.muted }).wrapping(text::Wrapping::None),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(style::node(on))
+                .on_press(Msg::Select(path)),
             ]
             .into()
         };
-        let mut col = column![node(0, "nginx.conf".into(), "main".into(), Vec::new())].spacing(1).padding(8);
+        let mut col = column![
+            container(text("BLOCKS").size(11).font(style::SEMIBOLD).color(c.muted)).padding([4, 10]),
+            node(0, "nginx.conf".into(), "file".into(), Vec::new()),
+        ]
+        .spacing(2)
+        .padding([14, 10]);
         for n in form::blocks(&self.tree) {
             col = col.push(node(n.depth, n.name, n.detail, n.path));
         }
@@ -650,165 +696,228 @@ impl Editor {
     }
 
     fn pane(&self) -> Element<'_, Msg> {
+        let c = style::colors();
         let tree = &self.tree;
         let ctx = form::ctx_of(tree, &self.sel);
         let Some(items) = form::items_at(tree, &self.sel) else { return text("").into() };
         let me = form::item_at(tree, &self.sel);
+        let title = match me {
+            Some(Item::Dir { name, args, .. }) => format!("{name} {}", args.join(" ")).trim().to_string(),
+            _ => "nginx.conf".into(),
+        };
         let mut col = column![
-            text(form::crumbs(tree, &self.sel).join(" › ")).size(13).style(text::secondary),
-            row![
-                text(match me {
-                    Some(Item::Dir { name, .. }) => name.as_str(),
-                    _ => "nginx.conf",
-                })
-                .size(22),
-                badge(form::ctx_label(ctx).to_string()),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            text(form::crumbs(tree, &self.sel).join("  ›  ")).size(12).color(c.muted),
+            row![text(title).size(24).font(style::SEMIBOLD), pill(form::ctx_label(ctx), style::pill)]
+                .spacing(12)
+                .align_y(Alignment::Center),
         ]
-        .spacing(10);
+        .spacing(8);
         match me {
             Some(it @ Item::Dir { name, args, .. }) => {
                 let parent_ctx = form::ctx_of(tree, &self.sel[..self.sel.len() - 1]);
                 match form::spec_for(&self.specs, name, parent_ctx) {
                     Some(spec) => {
-                        col = col.push(text(spec.help).style(text::secondary));
+                        col = col.push(text(spec.help).color(c.muted));
                         if !spec.args.is_empty() {
-                            col = col.push(self.fields(self.sel.clone(), spec, args));
+                            col = col.push(Space::new().height(4)).push(
+                                container(self.fields(self.sel.clone(), spec, args)).padding([12, 14]).style(style::card),
+                            );
                         }
                     }
-                    None if !args.is_empty() => col = col.push(self.generic(self.sel.clone(), it)),
+                    None if !args.is_empty() => {
+                        col = col.push(container(self.generic(self.sel.clone(), it)).padding([12, 14]).style(style::card))
+                    }
                     None => {}
                 }
             }
-            _ => {
-                col = col.push(
-                    text("Top level of the file. Open a block on the left, or add one below.").style(text::secondary),
-                )
-            }
+            _ => col = col.push(text("Top level of the file. Open a block on the left, or add one below.").color(c.muted)),
         }
-        let mut rows = column![].spacing(0);
+        let count = form::directive_count(items);
+        col = col.push(Space::new().height(10)).push(
+            row![
+                text("Directives").size(15).font(style::SEMIBOLD),
+                text(count.to_string()).size(13).color(c.muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        let mut rows = column![].spacing(8);
         for (i, it) in items.iter().enumerate() {
             let mut ip = self.sel.clone();
             ip.push(i);
-            rows = rows.push(self.item_row(ip, it, i, items.len(), ctx));
-            rows = rows.push(rule::horizontal(1));
+            rows = rows.push(self.item_row(ip, it, items, ctx));
         }
-        if items.is_empty() {
-            rows = rows.push(text("Empty block.").style(text::secondary));
+        if items.iter().all(|i| matches!(i, Item::Blank)) {
+            rows = rows.push(text("Nothing here yet.").color(c.muted));
         }
-        col = col.push(rows).push(self.add_bar(items, ctx));
+        col = col.push(rows).push(Space::new().height(6)).push(self.add_bar(items, ctx));
         if let Some(Item::Dir { name, .. }) = me {
-            col = col.push(
-                button(text(format!("Delete this {name} block")))
-                    .style(button::danger)
+            col = col.push(Space::new().height(6)).push(
+                button(text(format!("Delete this {name} block")).size(13))
+                    .padding([7, 14])
+                    .style(style::danger)
                     .on_press(Msg::Delete(self.sel.clone())),
             );
         }
         col.into()
     }
 
-    fn item_row(&self, ip: ItemPath, it: &Item, i: usize, len: usize, ctx: &str) -> Element<'_, Msg> {
-        let (name_cell, body, extra): (Element<'_, Msg>, Element<'_, Msg>, Option<Element<'_, Msg>>) = match it {
-            Item::Blank => (text("").into(), text("Empty line").size(13).style(text::secondary).into(), None),
+    fn item_row<'a>(&'a self, ip: ItemPath, it: &'a Item, items: &'a [Item], ctx: &str) -> Element<'a, Msg> {
+        let c = style::colors();
+        let i = *ip.last().unwrap_or(&0);
+        let tools = |extra: Option<Element<'static, Msg>>| -> Element<'static, Msg> {
+            let mut r = row![].spacing(0).align_y(Alignment::Center);
+            if let Some(e) = extra {
+                r = r.push(e);
+            }
+            r.push(icon("↑", "Move up", form::can_move(items, i, -1).then(|| Msg::Move(ip.clone(), -1))))
+                .push(icon("↓", "Move down", form::can_move(items, i, 1).then(|| Msg::Move(ip.clone(), 1))))
+                .push(icon("✕", "Delete", Some(Msg::Delete(ip.clone()))))
+                .into()
+        };
+        match it {
+            // Blank lines are kept in the file but not shown.
+            Item::Blank => Space::new().height(0).into(),
+            Item::Comment { text: t } if form::is_disabled_directive(t) => {
+                let shown = t.trim().trim_end_matches(';').to_string();
+                container(
+                    row![
+                        text(shown).font(Font::MONOSPACE).size(13).color(c.muted).width(Length::Fill),
+                        pill("disabled", style::pill_muted),
+                        button(text("Enable").size(13)).padding([5, 12]).style(style::secondary).on_press(Msg::Enable(ip.clone())),
+                        tools(None),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding([8, 14])
+                .style(style::card)
+                .into()
+            }
             Item::Comment { text: t } => {
-                let disabled = form::is_disabled_directive(t);
-                let input = text_input("comment", t).on_input({
-                    let ip = ip.clone();
-                    move |v| Msg::CommentText(ip.clone(), v)
-                });
-                let enable = disabled.then(|| tool("✓", "Enable this directive", Some(Msg::Enable(ip.clone()))));
-                (name_with("#", if disabled { "disabled directive" } else { "comment" }), input.into(), enable)
+                let line: Element<'_, Msg> = if self.editing.as_ref() == Some(&ip) {
+                    let ip2 = ip.clone();
+                    row![
+                        text("#").color(c.muted),
+                        text_input("comment", t)
+                            .id(COMMENT)
+                            .on_input(move |v| Msg::CommentText(ip2.clone(), v))
+                            .on_submit(Msg::EditComment(None))
+                            .size(13)
+                            .padding([5, 8])
+                            .style(style::input(false))
+                            .width(Length::Fill),
+                        button(text("Done").size(13)).padding([5, 12]).style(style::secondary).on_press(Msg::EditComment(None)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill)
+                    .into()
+                } else {
+                    text(format!("# {}", t.trim())).font(style::ITALIC).size(13).color(c.muted).width(Length::Fill).into()
+                };
+                // Comments get fewer tools, to keep them quiet; the text
+                // view can move them.
+                let actions = row![
+                    icon("✎", "Edit comment", Some(Msg::EditComment(Some(ip.clone())))),
+                    icon("✕", "Delete", Some(Msg::Delete(ip.clone()))),
+                ];
+                container(row![line, actions].spacing(8).align_y(Alignment::Center)).padding([0, 14]).into()
             }
             Item::Dir { name, args, block: Some(b), .. } => {
                 let n = form::directive_count(b);
                 let inner = form::inner_ctx(name, ctx);
-                let label = format!("{name} {}", args.join(" "));
-                let summary = row![
-                    text(format!("{n} directive{}", if n == 1 { "" } else { "s" })),
-                    button(text("Open")).style(button::secondary).on_press(Msg::Select(ip.clone())),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center);
-                (name_with_owned(label.trim().to_string(), form::ctx_label(inner).to_string()), summary.into(), None)
+                let summary = format!("{} · {n} directive{}", form::ctx_label(inner), if n == 1 { "" } else { "s" });
+                container(
+                    row![
+                        column![
+                            row![text(name.as_str()).font(style::SEMIBOLD), text(args.join(" ")).color(c.muted)].spacing(8),
+                            text(summary).size(12).color(c.muted),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(text("Open  →").size(13)).padding([6, 14]).style(style::secondary).on_press(Msg::Select(ip.clone())),
+                        tools(None),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding([12, 14])
+                .style(style::card)
+                .into()
             }
             Item::Dir { name, args, .. } => {
                 let spec = form::spec_for(&self.specs, name, ctx);
-                let cell = match spec {
-                    Some(s) => {
-                        let tip = if s.default.is_empty() { s.help.to_string() } else { format!("{}\nDefault: {}", s.help, s.default) };
-                        tooltip(name_with_owned(name.clone(), s.module.to_string()), hint_owned(tip), tooltip::Position::Bottom)
-                            .into()
-                    }
-                    None => name_with_owned(name.clone(), "unknown".into()),
-                };
+                let label = column![
+                    text(name.as_str()).font(style::SEMIBOLD),
+                    text(spec.map_or("unknown", |s| s.module)).size(12).color(c.muted),
+                ]
+                .spacing(2)
+                .width(190);
                 let body: Element<'_, Msg> = match spec {
                     Some(s) => {
                         let note = if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) };
-                        column![self.fields(ip.clone(), s, args), text(note).size(12).style(text::secondary)].spacing(4).into()
+                        column![self.fields(ip.clone(), s, args), text(note).size(12).color(c.muted)].spacing(6).into()
                     }
-                    None => row![self.generic(ip.clone(), it), badge("not used by this server".into())]
-                        .spacing(8)
+                    None => row![self.generic(ip.clone(), it), pill("not used by this server", style::pill_warn)]
+                        .spacing(10)
                         .align_y(Alignment::Center)
                         .into(),
                 };
-                (cell, body, Some(tool("#", "Disable (comment out)", Some(Msg::Disable(ip.clone())))))
+                let disable = icon("⊘", "Disable (comment out)", Some(Msg::Disable(ip.clone())));
+                container(
+                    row![label, container(body).width(Length::Fill), tools(Some(disable))]
+                        .spacing(14)
+                        .align_y(Alignment::Center),
+                )
+                .padding([12, 14])
+                .style(style::card)
+                .into()
             }
-        };
-        let tools = row![
-            extra.unwrap_or_else(|| Space::new().into()),
-            tool("↑", "Move up", (i > 0).then(|| Msg::Move(ip.clone(), -1))),
-            tool("↓", "Move down", (i + 1 < len).then(|| Msg::Move(ip.clone(), 1))),
-            tool("✕", "Delete", Some(Msg::Delete(ip.clone()))),
-        ]
-        .spacing(2)
-        .align_y(Alignment::Center);
-        row![container(name_cell).width(210), container(body).width(Length::Fill), tools]
-            .spacing(12)
-            .padding([8, 0])
-            .align_y(Alignment::Center)
-            .into()
+        }
     }
 
     /// The plain "arguments" field of a directive this server doesn't know.
     fn generic(&self, ip: ItemPath, it: &Item) -> Element<'_, Msg> {
         let Item::Dir { args, .. } = it else { return text("").into() };
         let value = self.drafts.get(&(ip.clone(), GENERIC)).cloned().unwrap_or_else(|| form::join_args(args));
-        text_input("arguments", &value).on_input(move |v| Msg::Generic(ip.clone(), v)).width(360).into()
+        field_input("arguments", &value, false).on_input(move |v| Msg::Generic(ip.clone(), v)).width(360).into()
     }
 
     /// The fields of directive `ip` described by `spec`.
     fn fields(&self, ip: ItemPath, spec: &Spec, args: &[String]) -> Element<'_, Msg> {
+        let c = style::colors();
         let vals = form::assign(spec, args);
-        let mut out = row![].spacing(14).align_y(Alignment::Center);
+        let mut out = row![].spacing(16).align_y(Alignment::Center);
         for (n, (a, v)) in spec.args.iter().zip(&vals).enumerate() {
-            let label = text(format!("{}{}", a.name, if a.opt { "?" } else { "" })).size(13).style(text::secondary);
+            let label = text(format!("{}{}", a.name, if a.opt { " (optional)" } else { "" })).size(12).color(c.muted);
             let widget = self.field(ip.clone(), n, a, v);
-            out = out.push(row![label, widget].spacing(6).align_y(Alignment::Center));
+            out = out.push(row![label, widget].spacing(8).align_y(Alignment::Center));
         }
-        out.wrap().vertical_spacing(6).into()
+        out.wrap().vertical_spacing(8).into()
     }
 
     fn field(&self, ip: ItemPath, n: usize, a: &Arg, v: &Val) -> Element<'_, Msg> {
         let list_field = |ip: ItemPath, v: &Val, width: f32| -> Element<'_, Msg> {
             let value = self.drafts.get(&(ip.clone(), n)).cloned().unwrap_or_else(|| form::join_args(&v.as_list()));
-            text_input(a.name, &value).on_input(move |s| Msg::SetList(ip.clone(), n, s)).width(width).into()
+            field_input(a.name, &value, false).on_input(move |s| Msg::SetList(ip.clone(), n, s)).width(width).into()
         };
         match (&a.kind, v) {
             (Kind::Choices(known), Val::Many(cur)) => {
-                let mut boxes = row![].spacing(10);
+                let mut boxes = row![].spacing(14);
                 let extra = cur.iter().filter(|c| !known.contains(&c.as_str())).cloned();
                 for o in known.iter().map(|s| s.to_string()).chain(extra) {
                     let on = cur.contains(&o);
                     let ip = ip.clone();
                     let value = o.clone();
-                    boxes = boxes.push(checkbox(on).label(o).on_toggle(move |b| Msg::Toggle(ip.clone(), n, value.clone(), b)));
+                    boxes = boxes.push(
+                        checkbox(on).label(o).size(16).text_size(13).on_toggle(move |b| Msg::Toggle(ip.clone(), n, value.clone(), b)),
+                    );
                 }
-                boxes.wrap().into()
+                boxes.wrap().vertical_spacing(6).into()
             }
             (Kind::Param(keys), Val::Many(cur)) => {
-                let mut list = row![].spacing(8).align_y(Alignment::Center);
+                let mut list = row![].spacing(10).align_y(Alignment::Center);
                 for (j, kv) in cur.iter().enumerate() {
                     let (key, value) = form::split_param(kv);
                     let mut options: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
@@ -818,17 +927,21 @@ impl Editor {
                     let (ip1, ip2, ip3) = (ip.clone(), ip.clone(), ip.clone());
                     list = list.push(
                         row![
-                            pick_list(options, Some(key.to_string()), move |k| Msg::ParamKey(ip1.clone(), n, j, k)),
+                            select(options, Some(key.to_string()), move |k| Msg::ParamKey(ip1.clone(), n, j, k)),
                             text("="),
-                            text_input("value", value).on_input(move |s| Msg::ParamValue(ip2.clone(), n, j, s)).width(120),
-                            tool("✕", "Remove", Some(Msg::ParamRemove(ip3, n, j))),
+                            field_input("value", value, false)
+                                .on_input(move |s| Msg::ParamValue(ip2.clone(), n, j, s))
+                                .width(130),
+                            icon("✕", "Remove", Some(Msg::ParamRemove(ip3, n, j))),
                         ]
                         .spacing(4)
                         .align_y(Alignment::Center),
                     );
                 }
-                list = list.push(button(text("+ param").size(13)).style(button::secondary).on_press(Msg::ParamAdd(ip, n)));
-                list.wrap().vertical_spacing(6).into()
+                list = list.push(
+                    button(text("+ parameter").size(13)).padding([5, 12]).style(style::secondary).on_press(Msg::ParamAdd(ip, n)),
+                );
+                list.wrap().vertical_spacing(8).into()
             }
             (_, Val::Many(_)) => list_field(ip, v, 360.0),
             (Kind::Flag | Kind::Choice(_), Val::One(cur)) => {
@@ -843,35 +956,27 @@ impl Editor {
                     options.insert(0, NONE.into());
                 }
                 let selected = if cur.is_empty() { a.opt.then(|| NONE.to_string()) } else { Some(cur.clone()) };
-                pick_list(options, selected, move |s: String| Msg::SetOne(ip.clone(), n, if s == NONE { String::new() } else { s }))
-                    .placeholder(a.name)
-                    .into()
+                select(options, selected, move |s: String| Msg::SetOne(ip.clone(), n, if s == NONE { String::new() } else { s }))
             }
             (kind, Val::One(cur)) => {
                 let bad = !cur.is_empty() && !form::valid(kind, cur);
                 let wide = matches!(kind, Kind::Url | Kind::Path | Kind::Text);
-                text_input(form::placeholder(a), cur)
+                field_input(form::placeholder(a), cur, bad)
                     .on_input(move |s| Msg::SetOne(ip.clone(), n, s))
-                    .width(if wide { 360 } else { 150 })
-                    .style(move |t: &Theme, s| {
-                        let mut st = text_input::default(t, s);
-                        if bad {
-                            st.border.color = t.palette().danger;
-                        }
-                        st
-                    })
+                    .width(if wide { 360 } else { 140 })
                     .into()
             }
         }
     }
 
     fn add_bar<'a>(&'a self, items: &[Item], ctx: &str) -> Element<'a, Msg> {
+        let c = style::colors();
         let options: Vec<AddOption> = form::available(&self.specs, items, ctx)
             .into_iter()
             .flat_map(|(module, list)| {
                 list.into_iter().map(move |s| AddOption {
                     name: s.name,
-                    label: format!("{module}: {}{}", s.name, if s.block.is_some() { " { }" } else { "" }),
+                    label: format!("{}{}   ({module})", s.name, if s.block.is_some() { " { }" } else { "" }),
                 })
             })
             .collect();
@@ -880,23 +985,36 @@ impl Editor {
             .as_ref()
             .and_then(|o| form::spec_for(&self.specs, o.name, ctx))
             .map(|s| if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) })
-            .unwrap_or_default();
-        column![
-            row![
-                pick_list(options, self.add_pick.clone(), Msg::AddPick).placeholder("Add a directive…").width(320),
-                button(text("Add")).style(button::secondary).on_press_maybe(self.add_pick.is_some().then_some(Msg::Add)),
-                button(text("Add comment")).style(button::secondary).on_press(Msg::AddComment),
-                text_input("or type: name args", &self.custom)
-                    .on_input(Msg::Custom)
-                    .on_submit(Msg::CustomSubmit)
-                    .width(220),
+            .unwrap_or_else(|| "Pick a directive this block accepts, or type one by hand.".into());
+        container(
+            column![
+                text("Add to this block").font(style::SEMIBOLD),
+                row![
+                    pick_list(options, self.add_pick.clone(), Msg::AddPick)
+                        .placeholder("Choose a directive…")
+                        .text_size(13)
+                        .padding([6, 10])
+                        .style(style::select)
+                        .width(300),
+                    button(text("Add").size(13).font(style::SEMIBOLD))
+                        .padding([7, 16])
+                        .style(style::primary)
+                        .on_press_maybe(self.add_pick.is_some().then_some(Msg::Add)),
+                    Space::new().width(6),
+                    field_input("or type: name args, then Enter", &self.custom, false)
+                        .on_input(Msg::Custom)
+                        .on_submit(Msg::CustomSubmit)
+                        .width(Length::Fill),
+                    button(text("Add comment").size(13)).padding([7, 14]).style(style::secondary).on_press(Msg::AddComment),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text(help).size(12).color(c.muted),
             ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            text(help).size(13).style(text::secondary),
-        ]
-        .spacing(6)
-        .padding([12, 0])
+            .spacing(10),
+        )
+        .padding([14, 16])
+        .style(style::card)
         .into()
     }
 
@@ -924,33 +1042,33 @@ impl Editor {
         };
         let card = container(
             column![
-                text(question),
+                text(question).size(15),
                 row![
                     Space::new().width(Length::Fill),
-                    button(text(no)).style(button::secondary).on_press(Msg::Answer(false)),
-                    button(text(yes)).style(button::danger).on_press(Msg::Answer(true)),
+                    button(text(no).size(13)).padding([7, 14]).style(style::secondary).on_press(Msg::Answer(false)),
+                    button(text(yes).size(13).font(style::SEMIBOLD))
+                        .padding([7, 16])
+                        .style(style::danger)
+                        .on_press(Msg::Answer(true)),
                 ]
                 .spacing(8),
             ]
-            .spacing(18),
+            .spacing(22),
         )
-        .padding(20)
-        .max_width(480)
-        .style(|t: &Theme| container::Style {
-            background: Some(t.palette().background.into()),
-            border: Border { radius: 8.0.into(), width: 1.0, color: t.extended_palette().background.strong.color },
-            ..container::Style::default()
-        });
-        opaque(
-            container(card)
-                .center(Length::Fill)
-                .style(|_| container::Style { background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()), ..Default::default() }),
-        )
+        .padding(22)
+        .max_width(460)
+        .style(style::dialog);
+        opaque(container(card).center(Length::Fill).style(style::backdrop))
     }
 }
 
 /// The "no value" entry of an optional choice.
 const NONE: &str = "—";
+
+/// The scrollable form, scrolled back to the top when another block is opened.
+const PANE: &str = "pane";
+/// The field of the comment being edited, focused when editing starts.
+const COMMENT: &str = "comment";
 
 fn split(ip: &[usize]) -> (&[usize], usize) {
     match ip.split_last() {
@@ -959,31 +1077,40 @@ fn split(ip: &[usize]) -> (&[usize], usize) {
     }
 }
 
-fn hint<'a>(s: &'a str) -> Element<'a, Msg> {
-    container(text(s).size(13)).padding([4, 8]).style(container::bordered_box).into()
+fn hline<'a>() -> Element<'a, Msg> {
+    rule::horizontal(1).style(|t| rule::Style { color: style::colors().border, ..rule::default(t) }).into()
 }
 
-fn hint_owned<'a>(s: String) -> Element<'a, Msg> {
-    container(text(s).size(13)).padding([4, 8]).max_width(420).style(container::bordered_box).into()
+fn vline<'a>() -> Element<'a, Msg> {
+    rule::vertical(1).style(|t| rule::Style { color: style::colors().border, ..rule::default(t) }).into()
 }
 
-fn badge<'a>(s: String) -> Element<'a, Msg> {
-    container(text(s).size(12)).padding([2, 8]).style(container::secondary).into()
+fn pill<'a>(s: impl Into<String>, st: fn(&Theme) -> container::Style) -> Element<'a, Msg> {
+    container(text(s.into()).size(11).font(style::SEMIBOLD)).padding([2, 9]).style(st).into()
 }
 
-fn name_with<'a>(name: &'a str, small: &'a str) -> Element<'a, Msg> {
-    column![text(name), text(small).size(12).style(text::secondary)].into()
+fn tip<'a>(s: &'a str) -> Element<'a, Msg> {
+    container(text(s).size(12)).padding([6, 10]).max_width(380).style(style::tooltip).into()
 }
 
-fn name_with_owned<'a>(name: String, small: String) -> Element<'a, Msg> {
-    column![text(name), text(small).size(12).style(text::secondary)].into()
+fn with_tip<'a>(content: impl Into<Element<'a, Msg>>, s: &'a str) -> Element<'a, Msg> {
+    tooltip(content, tip(s), tooltip::Position::Bottom).gap(4).into()
 }
 
-fn tool<'a>(label: &'a str, tip: &'a str, msg: Option<Msg>) -> Element<'a, Msg> {
+fn icon<'a>(label: &'a str, hint: &'a str, msg: Option<Msg>) -> Element<'a, Msg> {
     tooltip(
-        button(text(label).size(13)).padding([2, 8]).style(button::secondary).on_press_maybe(msg),
-        hint(tip),
-        tooltip::Position::Left,
+        button(text(label).size(14)).padding([3, 8]).style(style::ghost).on_press_maybe(msg),
+        tip(hint),
+        tooltip::Position::Top,
     )
+    .gap(2)
     .into()
+}
+
+fn field_input<'a>(placeholder: &str, value: &str, bad: bool) -> iced::widget::TextInput<'a, Msg> {
+    text_input(placeholder, value).size(13).padding([6, 10]).style(style::input(bad))
+}
+
+fn select<'a>(options: Vec<String>, selected: Option<String>, f: impl Fn(String) -> Msg + 'a) -> Element<'a, Msg> {
+    pick_list(options, selected, f).text_size(13).padding([6, 10]).style(style::select).into()
 }
