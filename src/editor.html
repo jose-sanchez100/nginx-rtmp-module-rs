@@ -80,6 +80,34 @@ footer .msg.err { background: var(--err-bg); color: var(--err); }
 footer .msg.warn { background: var(--warn-bg); color: var(--warn); }
 footer .msg.ok { background: var(--ok-bg); }
 .hidden { display: none !important; }
+/* help: notes about the block, messages on a directive, field problems */
+:root { --info: #00873e; --info-bg: #e2f3e8; }
+@media (prefers-color-scheme: dark) { :root { --info: #2fb565; --info-bg: #1b3324; } }
+.notices { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; }
+.notices:empty { display: none; }
+.notice { display: flex; gap: 10px; align-items: center; padding: 7px 10px; border-radius: 7px; border: 1px solid; }
+.notice .mark { flex: none; width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
+.notice .text { flex: 1; }
+.tone-info { color: var(--info); } .notice.tone-info { background: var(--info-bg); border-color: var(--info); }
+.tone-warn { color: var(--warn); } .notice.tone-warn { background: var(--warn-bg); border-color: var(--warn); }
+.tone-err { color: var(--err); } .notice.tone-err { background: var(--err-bg); border-color: var(--err); }
+.notice .text, .notice button { color: var(--text); }
+.msgs { width: 100%; font-size: 12px; }
+.msgs:empty { display: none; }
+.msgs div::before { content: "\25CF  "; font-size: 9px; }
+.field { display: inline-flex; flex-direction: column; gap: 2px; }
+.field.wide { flex: 1; min-width: 240px; }
+.field.wide input { width: 100%; }
+.problem { font-size: 11px; color: var(--err); }
+.problem:empty { display: none; }
+.badge.ok { background: var(--info-bg); color: var(--info); }
+.card { margin-top: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card h3 { font-size: 14px; margin: 0 0 6px; display: flex; gap: 10px; align-items: baseline; }
+.card h3 small { font-weight: normal; color: var(--muted); font-size: 12px; }
+.inh { display: grid; grid-template-columns: 210px 1fr auto auto; gap: 10px; align-items: center; padding: 3px 0; font-family: ui-monospace, Consolas, monospace; }
+.inh .from { font-family: system-ui, sans-serif; color: var(--muted); font-size: 12px; }
+.recipes { margin-top: 12px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.recipes .lbl { color: var(--muted); font-size: 12px; font-weight: 600; margin-right: 4px; }
 @media (max-width: 760px) {
   main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   nav { border-right: 0; border-bottom: 1px solid var(--line); max-height: 30vh; }
@@ -106,6 +134,8 @@ footer .msg.ok { background: var(--ok-bg); }
 "use strict";
 const base = location.pathname.replace(/\/?$/, "/");
 let schema = [], tree = [], hash = "", path = [], mode = "form", dirty = false, lastCheck = null;
+// Places in the open block that the help fills in (see applyHelp).
+let slots = null, helpSeq = 0;
 
 // ---------- helpers ----------
 const $ = (s) => document.querySelector(s);
@@ -211,11 +241,15 @@ function renderPane() {
   } else {
     pane.append(el("p", { class: "help" }, "Top level of the file. Open a block on the left, or add one below."));
   }
+  slots = { path: path.slice(), notices: el("div", { class: "notices" }), inherited: el("div"), recipes: el("div"), rows: {} };
+  pane.append(slots.notices);
   const rows = el("div", { class: "rows" });
   items.forEach((it, i) => rows.append(row(it, i, items, ctx)));
   if (!items.length) rows.append(el("div", { class: "row" }, el("span", { class: "help" }, "Empty block."), el("span"), el("span")));
   pane.append(rows);
+  pane.append(slots.inherited, slots.recipes);
   pane.append(addBar(items, ctx));
+  fetchHelp();
   if (self && ctx !== "main") {
     pane.append(el("div", { class: "add" }, el("button", { onclick: () => { if (confirm(`Delete "${self.name} ${self.args.join(" ")}" and everything in it?`)) { itemsAt(path.slice(0, -1)).splice(path[path.length - 1], 1); changed(); select(path.slice(0, -1)); } } }, `Delete this ${self.name} block`)));
   }
@@ -248,23 +282,32 @@ function row(it, i, items, ctx) {
     const q = path.concat(i);
     return el("div", { class: "row block" },
       el("div", { class: "name" }, it.name + " " + it.args.join(" "), el("small", {}, ctxLabel[inner] || "block")),
-      el("div", { class: "summary" }, `${n} directive${n === 1 ? "" : "s"} `, el("button", { onclick: () => select(q) }, "Open")),
+      el("div", { class: "summary" }, `${n} directive${n === 1 ? "" : "s"} `, el("button", { onclick: () => select(q) }, "Open"), blockMsgs(i)),
       tools(items, i));
   }
   const unk = unknownOf(ctx);
+  const slot = { it, fields: {}, msgs: el("div", { class: "msgs" }), pill: el("span"), reset: el("span"), over: el("span") };
+  slots.rows[i] = slot;
   const nameCell = el("div", { class: "name", title: spec ? spec.help + (spec.default ? `\nDefault: ${spec.default}` : "") : unk.help },
-    it.name, el("small", {}, spec ? spec.module : unk.module));
+    it.name, el("small", {}, spec ? spec.module : unk.module, " ", slot.pill));
   const box = el("div", { class: "args" });
-  if (spec) argWidgets(box, it, spec);
+  if (spec) argWidgets(box, it, spec, slot);
   else {
     box.append(genericArgs(it));
     box.append(el("span", { class: unk.warn ? "badge warn" : "badge", title: unk.help }, unk.label));
     box.append(el("div", { class: "note" }, unk.help));
   }
-  if (spec) box.append(el("div", { class: "note" }, spec.help + (spec.default ? ` Default: ${spec.default}.` : "")));
+  if (spec) box.append(el("div", { class: "note" }, spec.help + (spec.default ? ` Default: ${spec.default}.` : ""), slot.over));
+  box.append(slot.msgs);
   const disable = el("button", { class: "icon", title: "Disable (comment out)", onclick: () => {
     items[i] = { t: "comment", text: " " + joinArgs([it.name, ...it.args]) + ";" }; changed(); renderAll(); } }, "#");
-  return el("div", { class: "row" }, nameCell, box, tools(items, i, disable));
+  return el("div", { class: "row" }, nameCell, box, tools(items, i, [slot.reset, disable]));
+}
+
+function blockMsgs(i) {
+  const msgs = el("div", { class: "msgs" });
+  slots.rows[i] = { fields: {}, msgs };
+  return msgs;
 }
 
 function edited(it) { delete it.raw; changed(); }
@@ -309,7 +352,7 @@ function rebuild(spec, vals) {
   return args;
 }
 
-function argWidgets(box, it, spec) {
+function argWidgets(box, it, spec, slot) {
   const vals = assign(spec, it.args);
   const update = () => { it.args = rebuild(spec, vals); edited(it); };
   spec.args.forEach((a, n) => {
@@ -381,9 +424,18 @@ function argWidgets(box, it, spec) {
       const inp = el("input", { type: "text", class: wide ? "wide" : "", value: vals[n], placeholder: placeholders[t] || a.name, title: a.name,
         oninput: (e) => { vals[n] = e.target.value; e.target.classList.toggle("bad", !!pat && e.target.value !== "" && !pat.test(e.target.value)); update(); } });
       if (pat && vals[n] !== "" && !pat.test(vals[n])) inp.classList.add("bad");
-      box.append(lab, inp);
+      const prob = el("span", { class: "problem" });
+      if (slot) slot.fields[n] = { inp, prob };
+      box.append(lab, el("span", { class: wide ? "field wide" : "field" }, inp, prob));
     }
   });
+}
+
+// Put `it` after the last directive of the same name, else at the end.
+function insertDir(items, it) {
+  let at = items.length; for (let k = items.length - 1; k >= 0; k--) if (items[k].t === "dir" && items[k].name === it.name) { at = k + 1; break; }
+  items.splice(at, 0, it);
+  return at;
 }
 
 function addBar(items, ctx) {
@@ -413,9 +465,7 @@ function addBar(items, ctx) {
     }
     const it = { t: "dir", name: s.name, args, line: 0 };
     if (s.block) it.block = [];
-    // after the last directive of the same name, else at the end
-    let at = items.length; for (let k = items.length - 1; k >= 0; k--) if (items[k].t === "dir" && items[k].name === s.name) { at = k + 1; break; }
-    items.splice(at, 0, it); changed();
+    const at = insertDir(items, it); changed();
     if (s.block && !s.args.some((a) => !a.opt)) { select(path.concat(at)); return; }
     renderAll();
   };
@@ -426,6 +476,66 @@ function addBar(items, ctx) {
   return el("div", { class: "add" }, sel, el("button", { onclick: add }, "Add"),
     el("button", { onclick: () => { items.push({ t: "comment", text: " " }); changed(); renderAll(); } }, "Add comment"),
     custom, help);
+}
+
+// ---------- help ----------
+// Ask the server about the open block (notes, inherited settings, recipes,
+// field problems, messages); fills the slots without redrawing the inputs.
+async function fetchHelp() {
+  if (!slots || mode !== "form") return;
+  const seq = ++helpSeq, p = slots.path;
+  const r = await api("help", { tree, path: p });
+  if (seq !== helpSeq || r.error || !slots || !same(slots.path, p)) return;
+  applyHelp(r);
+  if (r.check) { lastCheck = r.check; showCheck(r.check); }
+}
+const toneMark = { info: "i", warn: "!", err: "!" };
+function applyHelp(h) {
+  const items = itemsAt(slots.path);
+  slots.notices.textContent = "";
+  for (const n of h.notes) {
+    const fix = n.fix ? el("button", { onclick: () => { items.push(...n.fix.add); changed(); renderAll(); } }, n.fix.label) : null;
+    slots.notices.append(el("div", { class: "notice tone-" + n.tone }, el("span", { class: "mark" }, toneMark[n.tone]), el("span", { class: "text" }, n.text), fix));
+  }
+  for (const [i, slot] of Object.entries(slots.rows)) {
+    const row = h.rows[i] || {};
+    slot.msgs.textContent = "";
+    for (const m of row.messages || []) slot.msgs.append(el("div", { class: "tone-" + m.tone }, m.text));
+    const probs = Object.fromEntries(row.problems || []);
+    for (const [n, f] of Object.entries(slot.fields)) {
+      f.prob.textContent = probs[n] || "";
+      f.inp.classList.toggle("bad", !!probs[n]);
+    }
+    if (!slot.it) continue;
+    const isDefault = !!row.default && joinArgs(row.default) === joinArgs(slot.it.args);
+    slot.pill.textContent = "";
+    if (isDefault) slot.pill.append(el("span", { class: "badge ok", title: "The same as the default value: this line could be removed." }, "default"));
+    slot.reset.textContent = "";
+    if (row.default && !isDefault) {
+      slot.reset.append(el("button", { class: "icon", title: "Reset to the default value: " + joinArgs(row.default), onclick: () => { slot.it.args = row.default.slice(); edited(slot.it); renderAll(); } }, "\u21BA"));
+    }
+    slot.over.textContent = row.overrides ? ` Replaces ${joinArgs(row.overrides.args)} set in ${row.overrides.from}.` : "";
+  }
+  slots.inherited.textContent = "";
+  if (h.inherited.length) {
+    const card = el("div", { class: "card" }, el("h3", {}, "Inherited", el("small", {}, "Set in outer blocks; they apply here too.")));
+    for (const x of h.inherited) {
+      card.append(el("div", { class: "inh" }, el("b", {}, x.name), el("span", {}, joinArgs(x.args)), el("span", { class: "from" }, "from " + x.from),
+        el("button", { title: "Give this block its own value", onclick: () => { insertDir(items, { t: "dir", name: x.name, args: x.args.slice(), line: 0 }); changed(); renderAll(); } }, "Override")));
+    }
+    slots.inherited.append(card);
+  }
+  slots.recipes.textContent = "";
+  if (h.recipes.length) {
+    const bar = el("div", { class: "recipes" }, el("span", { class: "lbl" }, "Quick start"));
+    for (const rc of h.recipes) {
+      bar.append(el("button", { title: rc.help, onclick: async () => {
+        const r = await api("recipe", { tree, path: slots.path, recipe: rc.id });
+        if (r.error) { status([["err", r.error]]); return; }
+        tree = r.tree; changed(); renderAll(); } }, rc.name));
+    }
+    slots.recipes.append(bar);
+  }
 }
 
 // ---------- status / checking ----------
@@ -445,7 +555,10 @@ let checkTimer = null;
 function changed() {
   setDirty(true);
   clearTimeout(checkTimer);
-  checkTimer = setTimeout(async () => { const r = await api("render", { tree }); if (r.check) { lastCheck = r.check; showCheck(r.check); } }, 400);
+  checkTimer = setTimeout(async () => {
+    if (mode === "form") return fetchHelp();
+    const r = await api("render", { tree }); if (r.check) { lastCheck = r.check; showCheck(r.check); }
+  }, 400);
 }
 function renderAll() { renderTree(); renderPane(); }
 

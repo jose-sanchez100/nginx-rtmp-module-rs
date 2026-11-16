@@ -153,7 +153,9 @@ While editing, the window explains what is wrong with a field, shows the server'
 messages on the directive they name, points out settings that need another one or
 have no effect (with a button that adds what is missing), lists what a block
 inherits from outer blocks and offers ready-made snippets for common setups
-(`src/conf_help.rs`). The browser page has the forms but not these hints.
+(`src/conf_help.rs`). The browser page shows the same help: it asks the editor's
+`api/help` for the open block and `api/recipe` to apply a snippet, so both use one
+implementation.
 
 - A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
   `location`) and, for the selected one, a form with every directive: on/off

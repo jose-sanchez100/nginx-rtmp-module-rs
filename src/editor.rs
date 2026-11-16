@@ -14,6 +14,7 @@
 //! pages open in the browser cannot read or change the configuration.
 
 use crate::conf_edit::{self, Item};
+use crate::conf_help as help;
 use serde_json::{Value, json};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -224,6 +225,25 @@ impl Editor {
                     Err(e) => error_reply(400, e),
                 }
             }
+            ("POST", "/api/help") => match tree_of(&body) {
+                Ok(tree) => json_reply(200, self.help(&tree, &path_of(&body))),
+                Err(e) => error_reply(400, e),
+            },
+            ("POST", "/api/recipe") => match tree_of(&body) {
+                Ok(mut tree) => {
+                    let path = path_of(&body);
+                    let ctx = crate::conf_form::ctx_of(&tree, &path);
+                    let recipe = body["recipe"].as_u64().and_then(|k| help::RECIPES.get(k as usize));
+                    match (recipe, crate::conf_form::items_at_mut(&mut tree, &path)) {
+                        (Some(r), Some(items)) => {
+                            help::apply(&crate::conf_schema::specs(), items, ctx, r);
+                            json_reply(200, json!({ "tree": tree }))
+                        }
+                        _ => error_reply(400, "no such recipe or block"),
+                    }
+                }
+                Err(e) => error_reply(400, e),
+            },
             ("POST", "/api/save") => self.save(&body).await,
             ("POST", "/api/reload") => match (self.apply)().await {
                 Ok(m) => json_reply(200, json!({ "ok": true, "message": m })),
@@ -250,6 +270,59 @@ impl Editor {
     /// What the server would say about `text`.
     fn check(&self, text: &str) -> Value {
         json!(crate::conf_form::Check::of(text, &file_name(&self.conf_path)))
+    }
+
+    /// The help for the block at `path` of `tree` (see [`crate::conf_help`]):
+    /// notes with their fixes, inherited settings, recipes, and for each
+    /// directive of the block the server's messages about it, what is
+    /// wrong with its fields, its default and the outer value it replaces.
+    fn help(&self, tree: &[Item], path: &[usize]) -> Value {
+        use crate::conf_form as form;
+        let specs = crate::conf_schema::specs();
+        let path = form::valid_path(tree, path);
+        let ctx = form::ctx_of(tree, &path);
+        let items = form::items_at(tree, &path).unwrap_or(&[]);
+        let check = form::Check::of(&conf_edit::render(tree), &file_name(&self.conf_path));
+        let located = help::locate(&check, &file_name(&self.conf_path), tree);
+        let msgs = |p: &[usize]| -> Vec<Value> {
+            located.iter().filter(|(q, _, _)| q == p).map(|(_, t, m)| json!({ "tone": tone(*t), "text": m })).collect()
+        };
+        let mut notes = if path.is_empty() { Vec::new() } else { msgs(&path) };
+        notes.extend(help::hints(tree, &path).into_iter().map(|h| {
+            json!({ "tone": tone(h.tone), "text": h.text, "fix": h.fix.map(|f| json!({ "label": f.label, "add": f.add })) })
+        }));
+        let mut rows = serde_json::Map::new();
+        for (i, it) in items.iter().enumerate() {
+            let Item::Dir { name, args, block, .. } = it else { continue };
+            let mut ip = path.clone();
+            ip.push(i);
+            let mut row = json!({ "messages": msgs(&ip) });
+            if let (Some(spec), None) = (form::spec_for(&specs, name, ctx), block) {
+                let problems: Vec<Value> = spec
+                    .args
+                    .iter()
+                    .zip(form::assign(spec, args))
+                    .enumerate()
+                    .filter_map(|(n, (a, v))| match v {
+                        form::Val::One(s) => help::field_problem(spec, a, &s).map(|p| json!([n, p])),
+                        form::Val::Many(_) => None,
+                    })
+                    .collect();
+                row["problems"] = json!(problems);
+                row["default"] = json!(help::default_args(spec));
+                row["overrides"] = json!(help::overrides(tree, &path, name).map(|(a, from)| json!({ "args": a, "from": from })));
+            }
+            rows.insert(i.to_string(), row);
+        }
+        let inherited: Vec<Value> = help::inherited(&specs, tree, &path)
+            .into_iter()
+            .map(|h| json!({ "name": h.name, "args": h.args, "from": h.from }))
+            .collect();
+        let recipes: Vec<Value> = help::recipes(ctx, items)
+            .into_iter()
+            .map(|k| json!({ "id": k, "name": help::RECIPES[k].name, "help": help::RECIPES[k].help }))
+            .collect();
+        json!({ "path": path, "notes": notes, "rows": rows, "inherited": inherited, "recipes": recipes, "check": check })
     }
 
     async fn save(&self, body: &Value) -> Reply {
@@ -284,6 +357,19 @@ impl Editor {
 
 fn tree_of(body: &Value) -> Result<Vec<Item>, String> {
     serde_json::from_value(body["tree"].clone()).map_err(|e| format!("invalid tree: {e}"))
+}
+
+/// The block path sent by the page (`[0, 2]`: third item of the first block).
+fn path_of(body: &Value) -> Vec<usize> {
+    body["path"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect()).unwrap_or_default()
+}
+
+fn tone(t: help::Tone) -> &'static str {
+    match t {
+        help::Tone::Info => "info",
+        help::Tone::Warn => "warn",
+        help::Tone::Err => "err",
+    }
 }
 
 fn file_name(p: &Path) -> String {

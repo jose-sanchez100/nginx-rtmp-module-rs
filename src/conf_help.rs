@@ -4,7 +4,8 @@
 //! ready-made snippets ("recipes") for common setups.
 //!
 //! Pure functions over the tree of [`crate::conf_edit`], used by the
-//! editor window.
+//! editor window and, through the editor's `api/help` and `api/recipe`,
+//! by the browser page.
 
 use crate::conf_edit::{self, Item};
 use crate::conf_form::{self as form, Check};

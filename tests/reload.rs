@@ -163,6 +163,30 @@ async fn editor_saves_and_reloads() {
     let (_, rendered) = call(ed.addr, "POST", &format!("{base}api/render"), &host, Some(json!({ "tree": tree }))).await;
     assert_eq!(rendered["check"]["ok"], true, "{rendered}");
 
+    // Help for the server block: recipes and a row for each directive.
+    let (st, h) = call(ed.addr, "POST", &format!("{base}api/help"), &host, Some(json!({ "tree": tree, "path": [1, 0] }))).await;
+    assert_eq!(st, 200, "{h}");
+    assert!(h["recipes"].as_array().unwrap().iter().any(|r| r["name"] == "Live application"), "{h}");
+    assert!(h["rows"]["0"]["problems"].as_array().unwrap().is_empty(), "{h}");
+    // A bad field, an inherited setting and a note with a fix.
+    let mut t2 = tree.clone();
+    t2[1]["block"].as_array_mut().unwrap().insert(0, json!({ "t": "dir", "name": "live", "args": ["off"] }));
+    let app = &mut t2[1]["block"][1]["block"][3]["block"];
+    app.as_array_mut().unwrap().push(json!({ "t": "dir", "name": "record_path", "args": ["/tmp"] }));
+    app.as_array_mut().unwrap().push(json!({ "t": "dir", "name": "drop_idle_publisher", "args": ["10x"] }));
+    let (_, h) = call(ed.addr, "POST", &format!("{base}api/help"), &host, Some(json!({ "tree": t2, "path": [1, 1, 3] }))).await;
+    assert_eq!(h["rows"]["2"]["problems"][0][0], 0, "{h}");
+    assert_eq!(h["rows"]["0"]["overrides"], json!({ "args": ["off"], "from": "rtmp" }), "{h}");
+    assert!(h["notes"].as_array().unwrap().iter().any(|n| n["fix"]["label"] == "Add record all"), "{h}");
+    let (_, hs) = call(ed.addr, "POST", &format!("{base}api/help"), &host, Some(json!({ "tree": t2, "path": [1, 1] }))).await;
+    assert!(hs["inherited"].as_array().unwrap().iter().any(|x| x["name"] == "live" && x["from"] == "rtmp"), "{hs}");
+    // A recipe comes back as the new tree.
+    let k = h["recipes"].as_array().unwrap().iter().find(|r| r["name"] == "Record to disk").unwrap()["id"].clone();
+    let (st, r) =
+        call(ed.addr, "POST", &format!("{base}api/recipe"), &host, Some(json!({ "tree": t2, "path": [1, 1, 3], "recipe": k }))).await;
+    assert_eq!(st, 200, "{r}");
+    assert!(r["tree"][1]["block"][1]["block"][3]["block"].as_array().unwrap().iter().any(|d| d["name"] == "record"), "{r}");
+
     // Invalid configurations are not saved.
     let (st, r) = call(ed.addr, "POST", &format!("{base}api/save"), &host, Some(json!({ "text": "rtmp { server { listen x; } }", "hash": loaded["hash"] }))).await;
     assert_eq!(st, 400, "{r}");
