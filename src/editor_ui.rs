@@ -7,8 +7,8 @@
 //! in the parent. It ends when the window is closed, or when its standard
 //! input closes because the parent has exited.
 //!
-//! Phase 1 of the move from WebView2: an empty window that proves the
-//! process model, size and start-up time.
+//! The window itself is in `editor_ui/app.rs`, its client of the editor
+//! API in `editor_ui/api.rs`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdout, Command, ExitCode, Stdio};
@@ -16,13 +16,12 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use iced::widget::{column, container, text};
-use iced::{Element, Length, Size, Subscription, Task, window};
+mod api;
+mod app;
 
 /// Hidden command-line flag that runs the window.
 pub const FLAG: &str = "--editor-ui";
 
-const TITLE: &str = "nginx configuration";
 /// The child writes this line once its window is open.
 const READY: &str = "ready";
 
@@ -135,18 +134,11 @@ pub fn run() -> ExitCode {
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
         std::process::exit(0);
     });
-    let url = url.trim().to_string();
-    let r = iced::application(move || Editor { url: url.clone() }, Editor::update, Editor::view)
-        .title(TITLE)
-        .subscription(Editor::subscription)
-        .window(window::Settings {
-            size: Size::new(1100.0, 780.0),
-            min_size: Some(Size::new(640.0, 420.0)),
-            position: window::Position::Centered,
-            ..window::Settings::default()
-        })
-        .run();
-    match r {
+    let Some(api) = api::Api::new(&url) else {
+        eprintln!("nginx: {FLAG}: invalid address");
+        return ExitCode::FAILURE;
+    };
+    match app::run(api) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("nginx: editor window: {e}");
@@ -155,37 +147,25 @@ pub fn run() -> ExitCode {
     }
 }
 
-struct Editor {
-    url: String,
-}
-
-#[derive(Debug, Clone)]
-enum Message {
-    Opened(window::Id),
-}
-
-impl Editor {
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Opened(id) => {
-                println!("{READY}");
-                let _ = std::io::stdout().flush();
-                window::gain_focus(id)
+/// Give the window (`id`: its HWND, from iced) the program's icon.
+fn set_icon(id: u64) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let hwnd = id as usize as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        for (which, cx, cy) in [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)] {
+            let icon = LoadImageW(
+                hinst,
+                std::ptr::without_provenance(1),
+                IMAGE_ICON,
+                GetSystemMetrics(cx),
+                GetSystemMetrics(cy),
+                LR_DEFAULTCOLOR,
+            );
+            if !icon.is_null() {
+                SendMessageW(hwnd, WM_SETICON, which as usize, icon as isize);
             }
         }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        window::open_events().map(Message::Opened)
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        // Show the address without the token.
-        let host = self.url.split('/').nth(2).unwrap_or("");
-        container(column![text(TITLE).size(24), text(format!("Editor API on {host}"))].spacing(8))
-            .padding(20)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
     }
 }
