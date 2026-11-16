@@ -23,7 +23,9 @@ This is not an nginx module and does not need nginx: it runs on
   `listen PORT ssl;`.
 - Enhanced RTMP codecs (HEVC, AV1, VP9) are forwarded.
 - Configuration editor in its own window (`nginx -e` or the tray menu) with a form for
-  every supported directive; saving reloads the running server without dropping
+  every supported directive, explanations of wrong values, settings that need each
+  other, inherited values and one-click recipes (recording, relaying to YouTube or
+  Twitch, a statistics page); saving reloads the running server without dropping
   connections (`-s reload` works too).
 - On Windows: runs without a console like nginx, error log, pid file,
   `-s stop|quit|reload`, and a tray icon listing streams and connections.

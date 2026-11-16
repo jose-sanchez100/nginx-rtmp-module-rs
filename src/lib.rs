@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod codec;
 pub mod conf_edit;
 pub mod conf_form;
+pub mod conf_help;
 pub mod conf_schema;
 pub mod config;
 pub mod control;

@@ -149,6 +149,12 @@ ends when the window is closed. Elsewhere, or if the window cannot be opened, th
 editor is shown as a web page in the browser (`src/editor.html`). The window is light or
 dark like Windows' app mode; `NGINX_EDITOR_THEME=light` or `dark` picks one.
 
+While editing, the window explains what is wrong with a field, shows the server's
+messages on the directive they name, points out settings that need another one or
+have no effect (with a button that adds what is missing), lists what a block
+inherits from outer blocks and offers ready-made snippets for common setups
+(`src/conf_help.rs`). The browser page has the forms but not these hints.
+
 - A tree of the blocks (`rtmp`, `server`, `application`, `recorder`, `http`,
   `location`) and, for the selected one, a form with every directive: on/off
   switches, choices, checkboxes for `record` / `rtmp_stat` / `listen ... ssl`,

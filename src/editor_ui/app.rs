@@ -11,6 +11,7 @@ use iced::widget::{
 use iced::{Alignment, Border, Color, Element, Font, Length, Subscription, Task, Theme, event, keyboard, window};
 use nginx_rtmp::conf_edit::{self, Item};
 use nginx_rtmp::conf_form::{self as form, Check, Level, Val};
+use nginx_rtmp::conf_help::{self as help, Tone};
 use nginx_rtmp::conf_schema::{Arg, Kind, Spec};
 use std::collections::HashMap;
 use std::io::Write;
@@ -71,6 +72,14 @@ enum Msg {
     /// Enter in the search box: the only match, or the text as written.
     AddSubmit,
     AddComment,
+    /// Add a ready-made snippet (index in `help::RECIPES`) to the open block.
+    Recipe(usize),
+    /// Add these items to the open block (the fix of a hint).
+    Fix(Vec<Item>),
+    /// Give the open block its own copy of an inherited setting.
+    Override(String, Vec<String>),
+    /// Replace the arguments of the directive at a path.
+    SetArgs(ItemPath, Vec<String>),
     // text view
     Edit(text_editor::Action),
     // header
@@ -93,6 +102,8 @@ struct Editor {
     dirty: bool,
     loaded: bool,
     check: Option<Check>,
+    /// The check's messages that name a directive, by its path.
+    located: Vec<(ItemPath, Tone, String)>,
     status: Vec<(Level, String)>,
     /// Shown first after the next load (the outcome of a save).
     pending: Option<(Level, String)>,
@@ -150,6 +161,7 @@ impl Editor {
             dirty: false,
             loaded: false,
             check: None,
+            located: Vec::new(),
             status: vec![(Level::Ok, "Loading…".into())],
             pending: None,
             busy: false,
@@ -381,6 +393,24 @@ impl Editor {
                 }
             }
             Msg::AddComment => self.push_item(Item::Comment { text: " ".into() }),
+            Msg::Recipe(k) => {
+                let ctx = form::ctx_of(&self.tree, &self.sel);
+                if let (Some(recipe), Some(items)) = (help::RECIPES.get(k), form::items_at_mut(&mut self.tree, &self.sel)) {
+                    help::apply(&self.specs, items, ctx, recipe);
+                    self.structure_changed(self.sel.clone());
+                }
+            }
+            Msg::Fix(add) => {
+                if let Some(items) = form::items_at_mut(&mut self.tree, &self.sel) {
+                    items.extend(add);
+                    self.structure_changed(self.sel.clone());
+                }
+            }
+            Msg::Override(name, args) => self.push_item(form::dir(&name, args, None)),
+            Msg::SetArgs(ip, args) => {
+                self.drafts.retain(|(p, _), _| p != &ip);
+                self.with_item(&ip, |it| form::set_args(it, args));
+            }
             Msg::Edit(action) => {
                 let edit = action.is_edit();
                 self.content.perform(action);
@@ -478,6 +508,9 @@ impl Editor {
             },
         }
         self.mode = m;
+        if m == Mode::Form {
+            self.show(None);
+        }
     }
 
     /// Status lines: `extra` first, then the check (its "valid" line only
@@ -488,6 +521,10 @@ impl Editor {
             out.extend(form::check_messages(c, self.dirty).into_iter().filter(|(l, _)| extra.is_none() || *l != Level::Ok));
         }
         self.status = out;
+        self.located = match (&self.check, self.mode) {
+            (Some(c), Mode::Form) => help::locate(c, &self.file, &self.tree),
+            _ => Vec::new(),
+        };
     }
 
     fn recheck(&mut self) {
@@ -789,6 +826,9 @@ impl Editor {
             }
             _ => col = col.push(text("Top level of the file. Open a block on the left, or add one below.").color(c.muted)),
         }
+        if let Some(n) = self.notices() {
+            col = col.push(Space::new().height(4)).push(n);
+        }
         let count = form::directive_count(items);
         col = col.push(Space::new().height(10)).push(
             row![
@@ -807,7 +847,11 @@ impl Editor {
         if items.iter().all(|i| matches!(i, Item::Blank)) {
             rows = rows.push(text("Nothing here yet.").color(c.muted));
         }
-        col = col.push(rows).push(Space::new().height(6)).push(self.add_bar());
+        col = col.push(rows).push(Space::new().height(6));
+        if let Some(card) = self.inherited_card() {
+            col = col.push(card);
+        }
+        col = col.push(self.add_bar());
         if let Some(Item::Dir { name, .. }) = me {
             col = col.push(Space::new().height(6)).push(
                 button(text(format!("Delete this {name} block")).size(13))
@@ -822,9 +866,9 @@ impl Editor {
     fn item_row<'a>(&'a self, ip: ItemPath, it: &'a Item, items: &'a [Item], ctx: &str) -> Element<'a, Msg> {
         let c = style::colors();
         let i = *ip.last().unwrap_or(&0);
-        let tools = |extra: Option<Element<'static, Msg>>| -> Element<'static, Msg> {
+        let tools = |extra: Vec<Element<'static, Msg>>| -> Element<'static, Msg> {
             let mut r = row![].spacing(0).align_y(Alignment::Center);
-            if let Some(e) = extra {
+            for e in extra {
                 r = r.push(e);
             }
             r.push(icon("↑", "Move up", form::can_move(items, i, -1).then(|| Msg::Move(ip.clone(), -1))))
@@ -842,7 +886,7 @@ impl Editor {
                         text(shown).font(Font::MONOSPACE).size(13).color(c.muted).width(Length::Fill),
                         pill("disabled", style::pill_muted),
                         button(text("Enable").size(13)).padding([5, 12]).style(style::secondary).on_press(Msg::Enable(ip.clone())),
-                        tools(None),
+                        tools(vec![]),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -891,10 +935,11 @@ impl Editor {
                             row![text(name.as_str()).font(style::SEMIBOLD), text(args.join(" ")).color(c.muted)].spacing(8),
                             text(summary).size(12).color(c.muted),
                         ]
+                        .push(self.messages(&ip))
                         .spacing(2)
                         .width(Length::Fill),
                         button(text("Open  →").size(13)).padding([6, 14]).style(style::secondary).on_press(Msg::Select(ip.clone())),
-                        tools(None),
+                        tools(vec![]),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -906,8 +951,16 @@ impl Editor {
             Item::Dir { name, args, .. } => {
                 let spec = form::spec_for(&self.specs, name, ctx);
                 let unknown = form::unknown(ctx);
+                let default = spec.and_then(help::default_args);
+                let is_default = default.as_deref() == Some(args.as_slice());
                 let sub: Element<'_, Msg> = match spec {
-                    Some(s) => text(s.module).size(12).color(c.muted).into(),
+                    Some(s) => row![text(s.module).size(12).color(c.muted)]
+                        .push(is_default.then(|| {
+                            with_tip(pill("default", style::pill_muted), "The same as the default value: this line could be removed.")
+                        }))
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .into(),
                     None => {
                         let badge = pill(unknown.label, if unknown.warn { style::pill_warn } else { style::pill_muted });
                         row![with_tip(badge, unknown.help)].into()
@@ -916,14 +969,24 @@ impl Editor {
                 let label = column![text(name.as_str()).font(style::SEMIBOLD), sub].spacing(4).width(190);
                 let body: Element<'_, Msg> = match spec {
                     Some(s) => {
-                        let note = if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) };
-                        column![self.fields(ip.clone(), s, args), text(note).size(12).color(c.muted)].spacing(6).into()
+                        let mut note = if s.default.is_empty() { s.help.to_string() } else { format!("{} Default: {}.", s.help, s.default) };
+                        if let Some((v, from)) = help::overrides(&self.tree, &self.sel, name) {
+                            note.push_str(&format!(" Replaces {} set in {from}.", form::join_args(&v)));
+                        }
+                        column![self.fields(ip.clone(), s, args), text(note).size(12).color(c.muted)]
+                            .push(self.messages(&ip))
+                            .spacing(6)
+                            .into()
                     }
                     None => column![self.generic(ip.clone(), it), text(unknown.help).size(12).color(c.muted)].spacing(6).into(),
                 };
-                let disable = icon("⊘", "Disable (comment out)", Some(Msg::Disable(ip.clone())));
+                let mut extra = Vec::new();
+                if let Some(d) = default.filter(|_| !is_default) {
+                    extra.push(icon("↺", "Reset to the default value", Some(Msg::SetArgs(ip.clone(), d))));
+                }
+                extra.push(icon("⊘", "Disable (comment out)", Some(Msg::Disable(ip.clone()))));
                 container(
-                    row![label, container(body).width(Length::Fill), tools(Some(disable))]
+                    row![label, container(body).width(Length::Fill), tools(extra)]
                         .spacing(14)
                         .align_y(Alignment::Center),
                 )
@@ -932,6 +995,98 @@ impl Editor {
                 .into()
             }
         }
+    }
+
+    /// The check's messages about the directive at `ip`.
+    fn messages(&self, ip: &[usize]) -> Option<Element<'_, Msg>> {
+        let mut col = column![].spacing(2);
+        let mut any = false;
+        for (_, tone, m) in self.located.iter().filter(|(p, _, _)| p == ip) {
+            any = true;
+            col = col.push(
+                row![text("●").size(10).color(style::tone(*tone)), text(m.as_str()).size(12).color(style::tone(*tone))]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            );
+        }
+        any.then(|| col.into())
+    }
+
+    /// Notes about the open block: the check's messages about it and how
+    /// its settings fit together, with a button that fixes it when there
+    /// is one.
+    fn notices(&self) -> Option<Element<'_, Msg>> {
+        let mut list: Vec<(Tone, String, Option<help::Fix>)> = self
+            .located
+            .iter()
+            .filter(|(p, _, _)| *p == self.sel && !self.sel.is_empty())
+            .map(|(_, t, m)| (*t, m.clone(), None))
+            .collect();
+        list.extend(help::hints(&self.tree, &self.sel).into_iter().map(|h| (h.tone, h.text, h.fix)));
+        if list.is_empty() {
+            return None;
+        }
+        let mut col = column![].spacing(8);
+        for (t, m, fix) in list {
+            let mark = match t {
+                Tone::Info => "i",
+                Tone::Warn | Tone::Err => "!",
+            };
+            let badge = container(text(mark).size(11).font(style::SEMIBOLD).color(style::tone(t)))
+                .center_x(18)
+                .center_y(18)
+                .style(move |_: &Theme| container::Style {
+                    border: Border { radius: 9.0.into(), width: 1.5, color: style::tone(t) },
+                    ..Default::default()
+                });
+            let fix = fix.map(|f| button(text(f.label).size(13)).padding([5, 12]).style(style::secondary).on_press(Msg::Fix(f.add)));
+            col = col.push(
+                container(row![badge, text(m).size(13).width(Length::Fill)].push(fix).spacing(10).align_y(Alignment::Center))
+                    .padding([9, 12])
+                    .style(style::notice(t)),
+            );
+        }
+        Some(col.into())
+    }
+
+    /// Settings of outer blocks that apply in the open block.
+    fn inherited_card(&self) -> Option<Element<'_, Msg>> {
+        let c = style::colors();
+        let list = help::inherited(&self.specs, &self.tree, &self.sel);
+        if list.is_empty() {
+            return None;
+        }
+        let mut rows = column![].spacing(4);
+        for h in list {
+            let override_ = button(text("Override").size(12)).padding([4, 10]).style(style::secondary);
+            rows = rows.push(
+                row![
+                    text(h.name.clone()).font(Font { weight: iced::font::Weight::Semibold, ..Font::MONOSPACE }).size(13).width(190),
+                    text(form::join_args(&h.args)).font(Font::MONOSPACE).size(13).width(Length::Fill),
+                    text(format!("from {}", h.from)).size(12).color(c.muted),
+                    with_tip(override_.on_press(Msg::Override(h.name, h.args)), "Give this block its own value"),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            );
+        }
+        Some(
+            container(
+                column![
+                    row![
+                        text("Inherited").font(style::SEMIBOLD),
+                        text("Set in outer blocks; they apply here too.").size(12).color(c.muted),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    rows,
+                ]
+                .spacing(10),
+            )
+            .padding([14, 16])
+            .style(style::card)
+            .into(),
+        )
     }
 
     /// The plain "arguments" field of a directive this server doesn't know.
@@ -948,13 +1103,14 @@ impl Editor {
         let mut out = row![].spacing(16).align_y(Alignment::Center);
         for (n, (a, v)) in spec.args.iter().zip(&vals).enumerate() {
             let label = text(format!("{}{}", a.name, if a.opt { " (optional)" } else { "" })).size(12).color(c.muted);
-            let widget = self.field(ip.clone(), n, a, v);
+            let widget = self.field(ip.clone(), n, spec, a, v);
             out = out.push(row![label, widget].spacing(8).align_y(Alignment::Center));
         }
         out.wrap().vertical_spacing(8).into()
     }
 
-    fn field(&self, ip: ItemPath, n: usize, a: &Arg, v: &Val) -> Element<'_, Msg> {
+    fn field(&self, ip: ItemPath, n: usize, spec: &Spec, a: &Arg, v: &Val) -> Element<'_, Msg> {
+        let c = style::colors();
         let list_field = |ip: ItemPath, v: &Val, width: f32| -> Element<'_, Msg> {
             let value = self.drafts.get(&(ip.clone(), n)).cloned().unwrap_or_else(|| form::join_args(&v.as_list()));
             field_input(a.name, &value, false).on_input(move |s| Msg::SetList(ip.clone(), n, s)).width(width).into()
@@ -1016,12 +1172,15 @@ impl Editor {
                 select(options, selected, move |s: String| Msg::SetOne(ip.clone(), n, if s == NONE { String::new() } else { s }))
             }
             (kind, Val::One(cur)) => {
-                let bad = !cur.is_empty() && !form::valid(kind, cur);
+                let problem = help::field_problem(spec, a, cur);
                 let wide = matches!(kind, Kind::Url | Kind::Path | Kind::Text);
-                field_input(form::placeholder(a), cur, bad)
+                let input = field_input(form::placeholder(a), cur, problem.is_some())
                     .on_input(move |s| Msg::SetOne(ip.clone(), n, s))
-                    .width(if wide { 360 } else { 140 })
-                    .into()
+                    .width(if wide { 360 } else { 140 });
+                match problem {
+                    Some(p) => column![input, text(p).size(11).color(c.danger)].spacing(3).into(),
+                    None => input.into(),
+                }
             }
         }
     }
@@ -1091,23 +1250,46 @@ impl Editor {
                     button(text("Add comment").size(13)).padding([6, 12]).style(style::secondary).on_press(Msg::AddComment),
                 ]
                 .align_y(Alignment::Center),
+            ]
+            .push(self.recipe_bar())
+            .push(
                 field_input("Search directives, or type name and arguments", &self.query, false)
                     .id(ADD)
                     .on_input(Msg::AddQuery)
                     .on_submit(Msg::AddSubmit)
                     .padding([8, 12])
                     .width(Length::Fill),
-                container(scrollable(list).height(Length::Shrink))
-                    .max_height(300)
-                    .padding(4)
-                    .style(style::well),
-                text(hint).size(12).color(c.muted),
-            ]
+            )
+            .push(container(scrollable(list).height(Length::Shrink)).max_height(300).padding(4).style(style::well))
+            .push(text(hint).size(12).color(c.muted))
             .spacing(10),
         )
         .padding([14, 16])
         .style(style::card)
         .into()
+    }
+
+    /// Buttons that add a ready-made snippet for a common setup.
+    fn recipe_bar(&self) -> Option<Element<'_, Msg>> {
+        let c = style::colors();
+        let items = form::items_at(&self.tree, &self.sel)?;
+        let list = help::recipes(form::ctx_of(&self.tree, &self.sel), items);
+        if list.is_empty() {
+            return None;
+        }
+        let mut buttons = row![].spacing(8);
+        for k in list {
+            let r = &help::RECIPES[k];
+            buttons = buttons.push(with_tip(
+                button(text(r.name).size(13)).padding([6, 12]).style(style::secondary).on_press(Msg::Recipe(k)),
+                r.help,
+            ));
+        }
+        Some(
+            column![text("Quick start").size(12).font(style::SEMIBOLD).color(c.muted), buttons.wrap().vertical_spacing(8)]
+                .spacing(6)
+                .into(),
+        )
     }
 
     fn dialog_view(&self, d: &Dialog) -> Element<'_, Msg> {

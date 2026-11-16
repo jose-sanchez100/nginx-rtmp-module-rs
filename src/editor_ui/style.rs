@@ -205,6 +205,30 @@ pub fn dialog(_: &Theme) -> container::Style {
     }
 }
 
+/// The colour of a hint: accent for information, then warning and danger.
+pub fn tone(t: nginx_rtmp::conf_help::Tone) -> Color {
+    let c = colors();
+    match t {
+        nginx_rtmp::conf_help::Tone::Info => c.accent,
+        nginx_rtmp::conf_help::Tone::Warn => c.warning,
+        nginx_rtmp::conf_help::Tone::Err => c.danger,
+    }
+}
+
+/// A hint box, tinted by its tone.
+pub fn notice(t: nginx_rtmp::conf_help::Tone) -> impl Fn(&Theme) -> container::Style {
+    move |_| {
+        let c = colors();
+        let k = tone(t);
+        container::Style {
+            background: Some(alpha(k, 0.08).into()),
+            text_color: Some(c.text),
+            border: Border { radius: 8.0.into(), width: 1.0, color: alpha(k, 0.35) },
+            ..Default::default()
+        }
+    }
+}
+
 /// The sunken area that holds the "add" list.
 pub fn well(_: &Theme) -> container::Style {
     let c = colors();
